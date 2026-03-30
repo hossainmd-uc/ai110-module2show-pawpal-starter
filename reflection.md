@@ -4,13 +4,80 @@
 
 **a. Initial design**
 
-- Briefly describe your initial UML design.
-- What classes did you include, and what responsibilities did you assign to each?
+My initial UML design separated the app into core data classes and one decision-making class.  
+The user flow was: add a pet, define tasks with duration in minutes, mark tasks as essential or non-essential, rank non-essential tasks, enter weekday/weekend availability, and generate a realistic care plan.
+
+- **Classes included and responsibilities**
+- **Pet**: stores pet information (for example, pet name) and the list of care tasks tied to that pet.
+	- Methods: `add_task(task)`, `remove_task(task)`, `list_tasks()`
+- **Task**: stores each care task and its scheduling metadata.
+	- Data: `task_name`, `duration_minutes`, `is_essential`, `is_selected_optional`, `optional_rank`
+	- Methods: `set_duration(minutes)`, `mark_essential()`, `mark_non_essential(rank)`, `select_optional()`, `unselect_optional()`, `get_duration()`
+- **Owner**: stores owner profile and time constraints for weekdays and weekends.
+	- Data: `owner_name`, `weekday_available_minutes`, `weekend_available_minutes`
+	- Methods: `set_owner_name(name)`, `set_weekday_time(minutes)`, `set_weekend_time(minutes)`, `get_available_time(day_type)`
+- **Scheduler**: reads `Owner`, `Pet`, and `Task` data; it schedules essential tasks first, then fills remaining minutes with selected ranked non-essential tasks.
+	- Methods: `schedule_essential_tasks(tasks, available_minutes)`, `get_selected_ranked_optional_tasks(tasks)`, `schedule_ranked_optional_tasks(ranked_optional_tasks, remaining_minutes)`, `generate_schedule(owner, pet, day_type)`, `calculate_remaining_minutes(available_minutes, scheduled_tasks)`
+
+- **Initial class relationships**
+- One owner can have one or more pets.
+- Each pet has multiple tasks, and each task has a duration in minutes.
+- The scheduler schedules all essential tasks first, then fills remaining time with ranked non-essential tasks that are marked as selected.
+- The scheduler uses owner availability and task metadata to adjust which tasks are scheduled and when.
+
+```mermaid
+classDiagram
+	class Pet {
+		+pet_name
+		+add_task(task)
+		+remove_task(task)
+		+list_tasks()
+	}
+
+	class Task {
+		+task_name
+		+duration_minutes
+		+is_essential
+		+is_selected_optional
+		+optional_rank
+		+set_duration(minutes)
+		+mark_essential()
+		+mark_non_essential(rank)
+		+select_optional()
+		+unselect_optional()
+		+get_duration()
+	}
+
+	class Owner {
+		+owner_name
+		+weekday_available_minutes
+		+weekend_available_minutes
+		+set_owner_name(name)
+		+set_weekday_time(minutes)
+		+set_weekend_time(minutes)
+		+get_available_time(day_type)
+	}
+
+	class Scheduler {
+		+schedule_essential_tasks(tasks, available_minutes)
+		+get_selected_ranked_optional_tasks(tasks)
+		+schedule_ranked_optional_tasks(ranked_optional_tasks, remaining_minutes)
+		+generate_schedule(owner, pet, day_type)
+		+calculate_remaining_minutes(available_minutes, scheduled_tasks)
+	}
+
+	Owner "1" --> "1..*" Pet : has
+	Pet "1" --> "0..*" Task : has
+	Scheduler --> Owner : reads
+	Scheduler --> Pet : reads
+	Scheduler --> Task : schedules
+```
 
 **b. Design changes**
 
-- Did your design change during implementation?
-- If yes, describe at least one change and why you made it.
+Yes. During implementation, I removed the separate `Preferences` class and moved optional-task selection and ranking into the `Task` class.
+
+I made this change to avoid duplicating scheduling data in two places. With a separate `Preferences` object, task state could become inconsistent (for example, a task marked optional in one object but missing in another). Keeping selection and rank directly on each task created a single source of truth, simplified the scheduler input, and made the logic easier to test and explain.
 
 ---
 
