@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import heapq
 from dataclasses import dataclass
+from datetime import date, timedelta
 from enum import Enum
 from typing import Dict, List, Optional, Tuple
+from uuid import uuid4
 
 
 class DayType(Enum):
@@ -13,6 +15,26 @@ class DayType(Enum):
 
     WEEKDAY = "weekday"
     WEEKEND = "weekend"
+
+
+class DayOfWeek(Enum):
+    """Supported specific days for weekly recurrence rules."""
+
+    MONDAY = "monday"
+    TUESDAY = "tuesday"
+    WEDNESDAY = "wednesday"
+    THURSDAY = "thursday"
+    FRIDAY = "friday"
+    SATURDAY = "saturday"
+    SUNDAY = "sunday"
+
+
+class RecurrenceType(Enum):
+    """Supported recurrence options for task occurrences."""
+
+    NONE = "none"
+    DAILY = "daily"
+    WEEKLY = "weekly"
 
 
 def _normalize_day_type(day_type: DayType | str) -> DayType:
@@ -28,6 +50,53 @@ def _normalize_day_type(day_type: DayType | str) -> DayType:
     raise ValueError(
         "day_type must be DayType.WEEKDAY, DayType.WEEKEND, 'weekday', or 'weekend'"
     )
+
+
+def _normalize_day_of_week(day_name: DayOfWeek | str) -> DayOfWeek:
+    """Convert user input into a validated day-of-week value."""
+    if isinstance(day_name, DayOfWeek):
+        return day_name
+    if isinstance(day_name, str):
+        normalized = day_name.strip().lower()
+        for value in DayOfWeek:
+            if value.value == normalized:
+                return value
+    valid = ", ".join(day.value for day in DayOfWeek)
+    raise ValueError(f"day_name must be one of: {valid}")
+
+
+def _normalize_recurrence_type(value: RecurrenceType | str) -> RecurrenceType:
+    """Convert user input into a validated recurrence type."""
+    if isinstance(value, RecurrenceType):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized == RecurrenceType.NONE.value:
+            return RecurrenceType.NONE
+        if normalized == RecurrenceType.DAILY.value:
+            return RecurrenceType.DAILY
+        if normalized == RecurrenceType.WEEKLY.value:
+            return RecurrenceType.WEEKLY
+    raise ValueError("recurrence_type must be 'none', 'daily', or 'weekly'")
+
+
+def _normalize_date(value: date | str | None) -> date | None:
+    """Normalize date input to a date instance or None."""
+    if value is None:
+        return None
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        return date.fromisoformat(value)
+    raise ValueError("Date value must be a date object, ISO date string, or None")
+
+
+def _day_type_for_date(target_date: date | str) -> DayType:
+    """Map a concrete date to weekday/weekend DayType."""
+    normalized = _normalize_date(target_date)
+    if normalized is None:
+        raise ValueError("target_date cannot be None")
+    return DayType.WEEKDAY if normalized.weekday() < 5 else DayType.WEEKEND
 
 
 def _validate_window(start_minute: int, end_minute: int) -> tuple[int, int]:
@@ -114,6 +183,12 @@ class Task:
         is_essential: bool = False,
         is_selected_optional: bool = False,
         optional_rank: Optional[int] = None,
+        recurrence_type: RecurrenceType | str = RecurrenceType.NONE,
+        recurrence_day: DayOfWeek | str | None = None,
+        due_date: date | str | None = None,
+        source_template_id: Optional[str] = None,
+        occurrence_id: Optional[str] = None,
+        is_template: bool = False,
     ) -> None:
         if not task_name.strip():
             raise ValueError("task_name cannot be empty")
@@ -125,13 +200,75 @@ class Task:
         self.is_essential = bool(is_essential)
         self.is_selected_optional = bool(is_selected_optional)
         self.optional_rank = optional_rank
+        self.recurrence_type = _normalize_recurrence_type(recurrence_type)
+        self.recurrence_day = (
+            _normalize_day_of_week(recurrence_day)
+            if recurrence_day is not None
+            else None
+        )
+        self.due_date = _normalize_date(due_date)
+        self.source_template_id = source_template_id or str(uuid4())
+        self.occurrence_id = occurrence_id or str(uuid4())
+        self.is_template = bool(is_template)
         self.is_completed = False
+        self.completed_at_date: date | None = None
 
         if self.is_essential:
             self.mark_essential()
         else:
             if self.optional_rank is not None and self.optional_rank <= 0:
                 raise ValueError("optional_rank must be a positive integer")
+
+        self.validate_recurrence_configuration()
+
+    def validate_recurrence_configuration(self) -> None:
+        """Validate recurrence-related fields for this task."""
+        if (
+            self.recurrence_type is RecurrenceType.WEEKLY
+            and self.recurrence_day is None
+        ):
+            raise ValueError("Weekly recurrence requires recurrence_day")
+        if (
+            self.recurrence_type is not RecurrenceType.WEEKLY
+            and self.recurrence_day is not None
+        ):
+            raise ValueError("recurrence_day is only valid for weekly recurrence")
+
+    def is_due_on_date(self, target_date: date | str) -> bool:
+        """Return True when this occurrence is due on target_date."""
+        if self.due_date is None:
+            return False
+        normalized = _normalize_date(target_date)
+        return normalized is not None and self.due_date == normalized
+
+    def clone_as_occurrence(self, target_date: date | str) -> Task:
+        """Create a new occurrence with same task metadata for target_date."""
+        normalized = _normalize_date(target_date)
+        if normalized is None:
+            raise ValueError("target_date cannot be None")
+        return Task(
+            task_name=self.task_name,
+            duration_minutes=self.duration_minutes,
+            is_essential=self.is_essential,
+            is_selected_optional=self.is_selected_optional,
+            optional_rank=self.optional_rank,
+            recurrence_type=self.recurrence_type,
+            recurrence_day=self.recurrence_day,
+            due_date=normalized,
+            source_template_id=self.source_template_id,
+            is_template=False,
+        )
+
+    def create_next_occurrence(self, current_date: date | str) -> Optional[Task]:
+        """Create the immediate next occurrence for recurring tasks."""
+        normalized = _normalize_date(current_date)
+        if normalized is None:
+            raise ValueError("current_date cannot be None")
+        if self.recurrence_type is RecurrenceType.NONE:
+            return None
+        if self.recurrence_type is RecurrenceType.DAILY:
+            return self.clone_as_occurrence(normalized + timedelta(days=1))
+        return self.clone_as_occurrence(normalized + timedelta(days=7))
 
     def set_duration(self, minutes: int) -> None:
         """Set task duration in minutes."""
@@ -167,13 +304,15 @@ class Task:
         """Return task duration in minutes."""
         return self.duration_minutes
 
-    def mark_completed(self) -> None:
+    def mark_completed(self, completed_on: date | str | None = None) -> None:
         """Mark this task as completed by the user."""
         self.is_completed = True
+        self.completed_at_date = _normalize_date(completed_on) or date.today()
 
     def mark_incomplete(self) -> None:
         """Reset this task to incomplete."""
         self.is_completed = False
+        self.completed_at_date = None
 
     def get_status(self) -> str:
         """Return completion status label for display."""
@@ -189,22 +328,50 @@ class Pet:
         self.pet_name = pet_name.strip()
         self.tasks: List[Task] = tasks if tasks is not None else []
         self._tasks_by_name: Dict[str, Task] = {}
+        self._tasks_by_occurrence_id: Dict[str, Task] = {}
 
     def add_task(self, task: Task) -> None:
         """Attach a task to this pet."""
-        key = task.task_name.lower()
-        if key in self._tasks_by_name:
-            raise ValueError(f"Task '{task.task_name}' already exists for this pet")
+        duplicate = next(
+            (
+                existing
+                for existing in self.tasks
+                if existing.source_template_id == task.source_template_id
+                and existing.due_date == task.due_date
+            ),
+            None,
+        )
+        if duplicate is not None:
+            raise ValueError(
+                "Task occurrence for this template and date already exists"
+            )
         self.tasks.append(task)
-        self._tasks_by_name[key] = task
+        self._tasks_by_name[task.task_name.lower()] = task
+        self._tasks_by_occurrence_id[task.occurrence_id] = task
+
+    def add_task_template(self, task: Task) -> None:
+        """Attach a recurrence template task to this pet."""
+        task.is_template = True
+        self.add_task(task)
+
+    def add_task_occurrence(self, task: Task) -> None:
+        """Attach a task occurrence to this pet."""
+        task.is_template = False
+        self.add_task(task)
 
     def remove_task(self, task: Task) -> None:
         """Remove a task from this pet."""
-        key = task.task_name.lower()
-        existing = self._tasks_by_name.pop(key, None)
+        existing = self._tasks_by_occurrence_id.pop(task.occurrence_id, None)
         if existing is None:
             raise ValueError(f"Task '{task.task_name}' not found for this pet")
         self.tasks.remove(existing)
+        remaining_same_name = [
+            t for t in self.tasks if t.task_name.lower() == task.task_name.lower()
+        ]
+        if remaining_same_name:
+            self._tasks_by_name[task.task_name.lower()] = remaining_same_name[-1]
+        else:
+            self._tasks_by_name.pop(task.task_name.lower(), None)
 
     def list_tasks(self) -> List[Task]:
         """Return all tasks linked to this pet."""
@@ -217,6 +384,85 @@ class Pet:
         if task is None:
             raise ValueError(f"Task '{task_name}' not found for this pet")
         return task
+
+    def get_task_by_occurrence_id(self, occurrence_id: str) -> Task:
+        """Find one occurrence by its unique occurrence_id."""
+        task = self._tasks_by_occurrence_id.get(occurrence_id)
+        if task is None:
+            raise ValueError("Occurrence not found")
+        return task
+
+    def list_due_occurrences(self, target_date: date | str) -> List[Task]:
+        """Return active occurrences due on the selected date."""
+        normalized = _normalize_date(target_date)
+        if normalized is None:
+            raise ValueError("target_date cannot be None")
+        return [
+            task
+            for task in self.tasks
+            if (not task.is_template)
+            and (not task.is_completed)
+            and task.due_date == normalized
+        ]
+
+    def complete_occurrence_and_regenerate(
+        self, occurrence_id: str, current_date: date | str
+    ) -> Optional[Task]:
+        """Complete one occurrence and create the immediate successor when recurring."""
+        task = self.get_task_by_occurrence_id(occurrence_id)
+        if task.is_completed:
+            return None
+        task.mark_completed(current_date)
+        next_occurrence = task.create_next_occurrence(task.due_date or current_date)
+        if next_occurrence is None:
+            return None
+
+        if any(
+            existing.source_template_id == next_occurrence.source_template_id
+            and existing.due_date == next_occurrence.due_date
+            for existing in self.tasks
+        ):
+            return None
+        self.add_task_occurrence(next_occurrence)
+        return next_occurrence
+
+    def ensure_occurrences_up_to(self, target_date: date | str) -> None:
+        """Materialize missing recurring occurrences up to target_date."""
+        normalized_target = _normalize_date(target_date)
+        if normalized_target is None:
+            raise ValueError("target_date cannot be None")
+
+        recurring_series: Dict[str, List[Task]] = {}
+        for task in self.tasks:
+            if task.recurrence_type is RecurrenceType.NONE:
+                continue
+            recurring_series.setdefault(task.source_template_id, []).append(task)
+
+        for series_tasks in recurring_series.values():
+            if not series_tasks:
+                continue
+            exemplar = series_tasks[0]
+            due_dates = [
+                task.due_date for task in series_tasks if task.due_date is not None
+            ]
+            if not due_dates:
+                continue
+
+            current_max = max(due_dates)
+            step_days = 1 if exemplar.recurrence_type is RecurrenceType.DAILY else 7
+
+            while current_max < normalized_target:
+                candidate_date = current_max + timedelta(days=step_days)
+                exists = any(
+                    task.source_template_id == exemplar.source_template_id
+                    and task.due_date == candidate_date
+                    for task in self.tasks
+                )
+                if not exists:
+                    self.add_task_occurrence(
+                        exemplar.clone_as_occurrence(candidate_date)
+                    )
+                current_max = candidate_date
 
     def complete_task(self, task_name: str) -> None:
         """Mark a named task as completed."""
@@ -306,6 +552,14 @@ class Owner:
     def get_schedulable_windows(self, day_type: DayType | str) -> List[tuple[int, int]]:
         """Return windows used by scheduler for a day type."""
         return self.get_available_windows(day_type)
+
+    def get_day_type_for_date(self, target_date: date | str) -> DayType:
+        """Return weekday/weekend category for a concrete date."""
+        return _day_type_for_date(target_date)
+
+    def get_windows_for_date(self, target_date: date | str) -> List[tuple[int, int]]:
+        """Return owner availability windows for a concrete date."""
+        return self.get_schedulable_windows(self.get_day_type_for_date(target_date))
 
     def get_available_time(self, day_type: DayType | str) -> int:
         """Return total available minutes across all normalized windows."""
@@ -449,12 +703,12 @@ class Scheduler:
     def generate_schedule(
         self, owner: Owner, pet: Pet, day_type: DayType | str
     ) -> tuple[List[ScheduledTask], List[UnscheduledTask]]:
-        """Generate a full schedule for one pet and day type."""
+        """Generate a full schedule for one pet and day type (legacy API)."""
         if owner.pets and pet not in owner.pets:
             raise ValueError("Selected pet is not associated with the owner")
 
         free_windows = owner.get_schedulable_windows(day_type)
-        tasks = pet.list_tasks()
+        tasks = [task for task in pet.list_tasks() if not task.is_completed]
 
         essential_scheduled, essential_unscheduled = self.schedule_essential_tasks(
             tasks, free_windows
@@ -468,6 +722,165 @@ class Scheduler:
         return (
             essential_scheduled + optional_scheduled,
             essential_unscheduled + optional_unscheduled,
+        )
+
+    def ensure_recurring_catch_up(self, owner: Owner, target_date: date | str) -> None:
+        """Materialize missing recurring occurrences up to target_date."""
+        for pet in owner.list_pets():
+            pet.ensure_occurrences_up_to(target_date)
+
+    def generate_schedule_for_date(
+        self, owner: Owner, pet: Pet, target_date: date | str
+    ) -> tuple[List[ScheduledTask], List[UnscheduledTask]]:
+        """Generate a date-scoped schedule for one pet."""
+        if owner.pets and pet not in owner.pets:
+            raise ValueError("Selected pet is not associated with the owner")
+
+        self.ensure_recurring_catch_up(owner, target_date)
+        free_windows = owner.get_windows_for_date(target_date)
+        tasks = pet.list_due_occurrences(target_date)
+
+        essential_scheduled, essential_unscheduled = self.schedule_essential_tasks(
+            tasks, free_windows
+        )
+        ranked_optional_tasks = self.get_selected_ranked_optional_tasks(tasks)
+        optional_scheduled, optional_unscheduled = self.schedule_ranked_optional_tasks(
+            ranked_optional_tasks, free_windows
+        )
+
+        return (
+            essential_scheduled + optional_scheduled,
+            essential_unscheduled + optional_unscheduled,
+        )
+
+    def generate_owner_schedule_for_date(
+        self, owner: Owner, target_date: date | str
+    ) -> OwnerScheduleResult:
+        """Generate shared-time schedule for all pets on a selected date."""
+        self.ensure_recurring_catch_up(owner, target_date)
+
+        pets = owner.list_pets()
+        schedule_by_pet: Dict[str, List[ScheduledTask]] = {
+            pet.pet_name: [] for pet in pets
+        }
+        unscheduled_by_pet: Dict[str, List[UnscheduledTask]] = {
+            pet.pet_name: [] for pet in pets
+        }
+
+        free_windows = owner.get_windows_for_date(target_date)
+
+        essential_entries: List[tuple[Pet, Task]] = []
+        optional_entries: List[tuple[Pet, Task]] = []
+        duration_heap = []
+
+        for pet in pets:
+            for task in pet.list_due_occurrences(target_date):
+                if task.is_essential:
+                    essential_entries.append((pet, task))
+                elif task.is_selected_optional:
+                    optional_entries.append((pet, task))
+                    heapq.heappush(
+                        duration_heap,
+                        (
+                            task.get_duration(),
+                            pet.pet_name.lower(),
+                            task.task_name.lower(),
+                            id(task),
+                        ),
+                    )
+
+        for pet, task in essential_entries:
+            duration = task.get_duration()
+            window_index = self._find_earliest_fit(free_windows, duration)
+            if window_index is None:
+                unscheduled_by_pet[pet.pet_name].append(
+                    UnscheduledTask(
+                        task=task,
+                        reason="No available time window can fit this essential task",
+                    )
+                )
+                continue
+            start_minute, end_minute = self._reserve_window_slice(
+                free_windows, window_index, duration
+            )
+            schedule_by_pet[pet.pet_name].append(
+                ScheduledTask(
+                    task=task, start_minute=start_minute, end_minute=end_minute
+                )
+            )
+
+        if not free_windows:
+            for pet, task in optional_entries:
+                unscheduled_by_pet[pet.pet_name].append(
+                    UnscheduledTask(
+                        task=task,
+                        reason="No remaining contiguous availability for optional task",
+                    )
+                )
+            return OwnerScheduleResult(
+                scheduled_by_pet=schedule_by_pet,
+                unscheduled_by_pet=unscheduled_by_pet,
+            )
+
+        optional_entries.sort(
+            key=lambda entry: (
+                entry[1].optional_rank if entry[1].optional_rank is not None else 10**9,
+                entry[0].pet_name.lower(),
+                entry[1].task_name.lower(),
+            )
+        )
+
+        scheduled_ids = set()
+        for pet, task in optional_entries:
+            while duration_heap and duration_heap[0][3] in scheduled_ids:
+                heapq.heappop(duration_heap)
+
+            if duration_heap:
+                min_duration = duration_heap[0][0]
+                if all((end - start) < min_duration for start, end in free_windows):
+                    break
+
+            if not free_windows:
+                break
+
+            duration = task.get_duration()
+            window_index = self._find_earliest_fit(free_windows, duration)
+            if window_index is None:
+                unscheduled_by_pet[pet.pet_name].append(
+                    UnscheduledTask(
+                        task=task,
+                        reason="No remaining contiguous availability for optional task",
+                    )
+                )
+                continue
+
+            start_minute, end_minute = self._reserve_window_slice(
+                free_windows, window_index, duration
+            )
+            schedule_by_pet[pet.pet_name].append(
+                ScheduledTask(
+                    task=task, start_minute=start_minute, end_minute=end_minute
+                )
+            )
+            scheduled_ids.add(id(task))
+
+        remaining_optional_ids = {
+            id(task) for _, task in optional_entries if id(task) not in scheduled_ids
+        }
+        for pet, task in optional_entries:
+            if id(task) in remaining_optional_ids and not any(
+                uns.task is task for uns in unscheduled_by_pet[pet.pet_name]
+            ):
+                unscheduled_by_pet[pet.pet_name].append(
+                    UnscheduledTask(
+                        task=task,
+                        reason="No remaining contiguous availability for optional task",
+                    )
+                )
+
+        return OwnerScheduleResult(
+            scheduled_by_pet=schedule_by_pet,
+            unscheduled_by_pet=unscheduled_by_pet,
         )
 
     def generate_owner_schedule(

@@ -1,10 +1,19 @@
 import hashlib
 import json
-from datetime import time
+from datetime import date, datetime, time, timedelta
+from uuid import uuid4
 
 import streamlit as st
 
-from pawpal_system import DayType, Owner, Pet, Scheduler, Task
+from pawpal_system import (
+    DayType,
+    DayOfWeek,
+    Owner,
+    RecurrenceType,
+    Pet,
+    Scheduler,
+    Task,
+)
 
 
 def to_minute_of_day(value: time) -> int:
@@ -43,6 +52,82 @@ def windows_total_minutes(windows: list[tuple[int, int]]) -> int:
     return sum(end - start for start, end in windows)
 
 
+def parse_iso_date(value: str) -> date:
+    """Parse YYYY-MM-DD date string into date object."""
+    return datetime.strptime(value, "%Y-%m-%d").date()
+
+
+def normalize_task_record(task_data: dict, default_due_date: str) -> dict:
+    """Backfill recurrence/date keys for legacy task records."""
+    normalized = dict(task_data)
+    normalized.setdefault("task_id", str(uuid4()))
+    normalized.setdefault("recurrence_type", RecurrenceType.NONE.value)
+    normalized.setdefault("recurrence_day", None)
+    normalized.setdefault("due_date", default_due_date)
+    normalized.setdefault("source_template_id", str(uuid4()))
+    normalized.setdefault("is_template", False)
+    normalized.setdefault("completed_at_date", None)
+    return normalized
+
+
+def ensure_catch_up_for_tasks(tasks: list[dict], target_date_iso: str) -> list[dict]:
+    """Materialize missing recurring occurrences up to target date in UI state."""
+    target_date = parse_iso_date(target_date_iso)
+    updated = list(tasks)
+
+    grouped: dict[str, list[dict]] = {}
+    for task in updated:
+        recurrence = str(task.get("recurrence_type", RecurrenceType.NONE.value))
+        if recurrence == RecurrenceType.NONE.value:
+            continue
+        grouped.setdefault(str(task["source_template_id"]), []).append(task)
+
+    for series in grouped.values():
+        exemplar = series[0]
+        due_dates = [
+            parse_iso_date(str(item["due_date"]))
+            for item in series
+            if item.get("due_date")
+        ]
+        if not due_dates:
+            continue
+        step_days = (
+            1 if exemplar["recurrence_type"] == RecurrenceType.DAILY.value else 7
+        )
+        current_max = max(due_dates)
+
+        while current_max < target_date:
+            candidate = current_max + timedelta(days=step_days)
+            candidate_iso = candidate.isoformat()
+            exists = any(
+                str(item.get("source_template_id"))
+                == str(exemplar.get("source_template_id"))
+                and str(item.get("due_date")) == candidate_iso
+                for item in updated
+            )
+            if not exists:
+                updated.append(
+                    {
+                        "task_id": str(uuid4()),
+                        "task_name": exemplar["task_name"],
+                        "duration_minutes": int(exemplar["duration_minutes"]),
+                        "is_essential": bool(exemplar["is_essential"]),
+                        "is_selected_optional": bool(exemplar["is_selected_optional"]),
+                        "optional_rank": exemplar.get("optional_rank"),
+                        "is_completed": False,
+                        "recurrence_type": exemplar["recurrence_type"],
+                        "recurrence_day": exemplar.get("recurrence_day"),
+                        "due_date": candidate_iso,
+                        "source_template_id": exemplar["source_template_id"],
+                        "is_template": False,
+                        "completed_at_date": None,
+                    }
+                )
+            current_max = candidate
+
+    return updated
+
+
 def compute_state_hash() -> str:
     """
     Generate hash of current scheduling state for caching.
@@ -54,11 +139,16 @@ def compute_state_hash() -> str:
         pets_data[pet_name] = {
             "tasks": [
                 {
+                    "id": t.get("task_id"),
                     "name": t["task_name"],
                     "duration": t["duration_minutes"],
                     "essential": t["is_essential"],
                     "rank": t.get("optional_rank"),
                     "completed": t.get("is_completed", False),
+                    "recurrence": t.get("recurrence_type", RecurrenceType.NONE.value),
+                    "recurrence_day": t.get("recurrence_day"),
+                    "due_date": t.get("due_date"),
+                    "source_template_id": t.get("source_template_id"),
                 }
                 for t in pet_info["tasks"]
             ]
@@ -66,6 +156,7 @@ def compute_state_hash() -> str:
 
     state = {
         "owner": st.session_state.owner_name,
+        "selected_date": st.session_state.selected_date,
         "weekday_windows": st.session_state.weekday_available_windows,
         "weekend_windows": st.session_state.weekend_available_windows,
         "pets": pets_data,
@@ -83,6 +174,8 @@ def init_state() -> None:
         st.session_state.weekend_available_windows = [(600, 720)]
     if "pets" not in st.session_state:
         st.session_state.pets = {}
+    if "selected_date" not in st.session_state:
+        st.session_state.selected_date = date.today().isoformat()
     if "last_schedule" not in st.session_state:
         st.session_state.last_schedule = None
     if "last_unscheduled" not in st.session_state:
@@ -98,24 +191,27 @@ def init_state() -> None:
     if "window_editor_day" not in st.session_state:
         st.session_state.window_editor_day = DayType.WEEKDAY.value
 
+    # Backward compatibility normalization for legacy task records.
+    for pet_name, pet_data in st.session_state.pets.items():
+        normalized_tasks = [
+            normalize_task_record(task, st.session_state.selected_date)
+            for task in pet_data.get("tasks", [])
+        ]
+        st.session_state.pets[pet_name]["tasks"] = normalized_tasks
 
-def calculate_essential_time() -> tuple[int, int]:
-    """
-    Return total essential task duration for (weekday, weekend).
-    #11: Precompute Total Essential Time
-    Runs on every Streamlit page rerun (automatically updates).
-    """
-    weekday_essential = 0
-    weekend_essential = 0
 
+def calculate_essential_time_for_date(target_date_iso: str) -> int:
+    """Return total essential task duration due on selected date."""
+    total = 0
     for pet_data in st.session_state.pets.values():
         for task in pet_data["tasks"]:
-            if task["is_essential"] and not task.get("is_completed", False):
-                duration = int(task["duration_minutes"])
-                weekday_essential += duration
-                weekend_essential += duration
-
-    return weekday_essential, weekend_essential
+            if (
+                task["is_essential"]
+                and not task.get("is_completed", False)
+                and str(task.get("due_date")) == target_date_iso
+            ):
+                total += int(task["duration_minutes"])
+    return total
 
 
 def calculate_capacity_minutes() -> tuple[int, int]:
@@ -142,9 +238,17 @@ def build_owner_from_state() -> Owner:
                 is_essential=bool(task_data["is_essential"]),
                 is_selected_optional=bool(task_data["is_selected_optional"]),
                 optional_rank=task_data["optional_rank"],
+                recurrence_type=task_data.get(
+                    "recurrence_type", RecurrenceType.NONE.value
+                ),
+                recurrence_day=task_data.get("recurrence_day"),
+                due_date=task_data.get("due_date"),
+                source_template_id=task_data.get("source_template_id"),
+                occurrence_id=task_data.get("task_id"),
+                is_template=bool(task_data.get("is_template", False)),
             )
             if bool(task_data.get("is_completed", False)):
-                task.mark_completed()
+                task.mark_completed(task_data.get("completed_at_date"))
             pet.add_task(task)
         owner.add_pet(pet)
 
@@ -162,6 +266,9 @@ def task_rows_for_pet(pet_data: dict) -> list[dict]:
                 "essential": task["is_essential"],
                 "selected_optional": task["is_selected_optional"],
                 "optional_rank": task["optional_rank"],
+                "recurrence": task.get("recurrence_type", RecurrenceType.NONE.value),
+                "recurrence_day": task.get("recurrence_day"),
+                "due_date": task.get("due_date"),
                 "status": "completed" if task.get("is_completed", False) else "pending",
             }
         )
@@ -293,13 +400,32 @@ else:
 
     with st.form("add_task_form"):
         task_name = st.text_input("Task name")
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
         with col1:
             duration_minutes = st.number_input(
                 "Duration (minutes)", min_value=1, max_value=480, value=15
             )
         with col2:
             is_essential = st.checkbox("Essential task", value=True)
+        with col3:
+            recurrence_type = st.selectbox(
+                "Recurrence",
+                options=[
+                    RecurrenceType.NONE.value,
+                    RecurrenceType.DAILY.value,
+                    RecurrenceType.WEEKLY.value,
+                ],
+            )
+        recurrence_day = None
+        if recurrence_type == RecurrenceType.WEEKLY.value:
+            recurrence_day = st.selectbox(
+                "Weekly day",
+                options=[day.value for day in DayOfWeek],
+            )
+        due_date_input = st.date_input(
+            "Due date",
+            value=parse_iso_date(st.session_state.selected_date),
+        )
         submit_task = st.form_submit_button("Add task")
 
         if submit_task:
@@ -313,12 +439,19 @@ else:
             else:
                 selected_pet_data["tasks"].append(
                     {
+                        "task_id": str(uuid4()),
                         "task_name": clean_name,
                         "duration_minutes": int(duration_minutes),
                         "is_essential": bool(is_essential),
                         "is_selected_optional": not bool(is_essential),
                         "optional_rank": None,
                         "is_completed": False,
+                        "recurrence_type": recurrence_type,
+                        "recurrence_day": recurrence_day,
+                        "due_date": due_date_input.isoformat(),
+                        "source_template_id": str(uuid4()),
+                        "is_template": False,
+                        "completed_at_date": None,
                     }
                 )
                 st.success(f"Added task '{clean_name}' to {selected_pet_for_tasks}")
@@ -378,11 +511,60 @@ else:
         task_names = [t["task_name"] for t in selected_pet_data["tasks"]]
         action_col1, action_col2, action_col3 = st.columns(3)
         with action_col1:
-            completion_target = st.selectbox("Task status target", options=task_names)
+            completion_options = {
+                f"{t['task_name']} [{t.get('due_date')}]": t.get("task_id")
+                for t in selected_pet_data["tasks"]
+            }
+            completion_target = st.selectbox(
+                "Task status target", options=list(completion_options.keys())
+            )
             if st.button("Mark completed"):
                 for task in selected_pet_data["tasks"]:
-                    if task["task_name"] == completion_target:
+                    if task.get("task_id") == completion_options.get(completion_target):
                         task["is_completed"] = True
+                        task["completed_at_date"] = st.session_state.selected_date
+
+                        recurrence = str(
+                            task.get("recurrence_type", RecurrenceType.NONE.value)
+                        )
+                        if recurrence != RecurrenceType.NONE.value:
+                            base_due = parse_iso_date(str(task.get("due_date")))
+                            next_due = (
+                                base_due + timedelta(days=1)
+                                if recurrence == RecurrenceType.DAILY.value
+                                else base_due + timedelta(days=7)
+                            )
+                            next_due_iso = next_due.isoformat()
+                            exists = any(
+                                str(existing.get("source_template_id"))
+                                == str(task.get("source_template_id"))
+                                and str(existing.get("due_date")) == next_due_iso
+                                for existing in selected_pet_data["tasks"]
+                            )
+                            if not exists:
+                                selected_pet_data["tasks"].append(
+                                    {
+                                        "task_id": str(uuid4()),
+                                        "task_name": task["task_name"],
+                                        "duration_minutes": int(
+                                            task["duration_minutes"]
+                                        ),
+                                        "is_essential": bool(task["is_essential"]),
+                                        "is_selected_optional": bool(
+                                            task["is_selected_optional"]
+                                        ),
+                                        "optional_rank": task.get("optional_rank"),
+                                        "is_completed": False,
+                                        "recurrence_type": recurrence,
+                                        "recurrence_day": task.get("recurrence_day"),
+                                        "due_date": next_due_iso,
+                                        "source_template_id": task.get(
+                                            "source_template_id"
+                                        ),
+                                        "is_template": False,
+                                        "completed_at_date": None,
+                                    }
+                                )
                         break
                 st.success(f"Marked '{completion_target}' as completed")
         with action_col2:
@@ -408,53 +590,65 @@ else:
     st.divider()
     st.subheader("4) Generate Shared-Time Schedule")
 
-    weekday_essential, weekend_essential = calculate_essential_time()
+    selected_date_value = st.date_input(
+        "Schedule date",
+        value=parse_iso_date(st.session_state.selected_date),
+        key="selected_schedule_date",
+    )
+    st.session_state.selected_date = selected_date_value.isoformat()
+
+    for pet_name in st.session_state.pets:
+        st.session_state.pets[pet_name]["tasks"] = ensure_catch_up_for_tasks(
+            st.session_state.pets[pet_name]["tasks"], st.session_state.selected_date
+        )
+
+    selected_day_type = (
+        DayType.WEEKDAY.value
+        if selected_date_value.weekday() < 5
+        else DayType.WEEKEND.value
+    )
+
+    essential_for_date = calculate_essential_time_for_date(
+        st.session_state.selected_date
+    )
     weekday_capacity, weekend_capacity = calculate_capacity_minutes()
+    day_capacity = (
+        weekday_capacity
+        if selected_day_type == DayType.WEEKDAY.value
+        else weekend_capacity
+    )
 
     col1, col2 = st.columns(2)
     with col1:
-        st.metric("Weekday Essential Tasks", f"{weekday_essential} min")
-        if weekday_essential > weekday_capacity:
-            st.error(
-                f"Exceeds available time by {weekday_essential - weekday_capacity} min"
-            )
-        else:
-            remaining = weekday_capacity - weekday_essential
-            st.success(f"{remaining} min available after essentials")
+        st.metric("Selected Date", st.session_state.selected_date)
+        st.caption(f"Derived day type: {selected_day_type}")
 
     with col2:
-        st.metric("Weekend Essential Tasks", f"{weekend_essential} min")
-        if weekend_essential > weekend_capacity:
+        st.metric("Essential Due This Date", f"{essential_for_date} min")
+        if essential_for_date > day_capacity:
             st.error(
-                f"Exceeds available time by {weekend_essential - weekend_capacity} min"
+                f"Exceeds available time by {essential_for_date - day_capacity} min"
             )
         else:
-            remaining = weekend_capacity - weekend_essential
+            remaining = day_capacity - essential_for_date
             st.success(f"{remaining} min available after essentials")
-
-    day_choice = st.radio(
-        "Day type",
-        options=[DayType.WEEKDAY.value, DayType.WEEKEND.value],
-        index=0 if st.session_state.last_day_type == DayType.WEEKDAY.value else 1,
-        horizontal=True,
-    )
 
     if st.button("Generate owner schedule"):
         try:
-            cache_key = f"{compute_state_hash()}_{day_choice}"
+            cache_key = f"{compute_state_hash()}_{st.session_state.selected_date}"
 
             if cache_key in st.session_state.schedule_cache:
                 schedule_result = st.session_state.schedule_cache[cache_key]
                 st.session_state.previous_schedule = st.session_state.last_schedule
                 st.session_state.last_schedule = schedule_result.scheduled_by_pet
                 st.session_state.last_unscheduled = schedule_result.unscheduled_by_pet
-                st.session_state.last_day_type = day_choice
+                st.session_state.last_day_type = selected_day_type
                 st.success("Schedule retrieved from cache")
             else:
                 owner_model = build_owner_from_state()
                 scheduler = Scheduler()
-                schedule_result = scheduler.generate_owner_schedule(
-                    owner_model, day_choice
+                schedule_result = scheduler.generate_owner_schedule_for_date(
+                    owner_model, st.session_state.selected_date
                 )
 
                 st.session_state.schedule_cache[cache_key] = schedule_result
@@ -462,7 +656,7 @@ else:
                 st.session_state.previous_schedule = st.session_state.last_schedule
                 st.session_state.last_schedule = schedule_result.scheduled_by_pet
                 st.session_state.last_unscheduled = schedule_result.unscheduled_by_pet
-                st.session_state.last_day_type = day_choice
+                st.session_state.last_day_type = selected_day_type
 
                 if len(st.session_state.schedule_cache) > 5:
                     oldest_key = next(iter(st.session_state.schedule_cache))
@@ -474,11 +668,6 @@ else:
 
     if st.session_state.last_schedule is not None:
         st.markdown("Generated schedule")
-        day_capacity = (
-            weekday_capacity
-            if st.session_state.last_day_type == DayType.WEEKDAY.value
-            else weekend_capacity
-        )
 
         added_tasks = {}
         removed_tasks = {}
