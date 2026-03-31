@@ -61,9 +61,11 @@ else:
 - **Better UX**: Faster response times improve user experience
 
 ### Considerations
-- Cache invalidation: Clear cache when pets/tasks are modified
-- Memory usage: Limit cache size (e.g., keep only last 5 schedules)
-- Cache should be per-session (already handled by `st.session_state`)
+- **Cache invalidation**: Clear cache when pets/tasks are modified (add/remove/complete tasks)
+- **Memory usage**: Limit cache size (e.g., keep only last 5 schedules)
+- **Cache should be per-session**: Already handled by `st.session_state`
+- **Coordination with #7 (Incremental Updates)**: If implementing both, incremental updates must invalidate cache OR update cache simultaneously. Consider whether cache regeneration is faster than incremental update logic.
+- **Hash computation**: The example hashes `st.session_state.pets` directly, but this contains Task objects. In practice, extract only serializable fields (task names, durations, completion status) for hashing.
 
 ---
 
@@ -105,6 +107,8 @@ for pet, task in optional_entries:
 ---
 
 ## 3. Pre-filter Completed Tasks
+
+> **⚠️ Implementation Note**: Consider implementing **#1 (Cache Scheduling Results)** first. Pre-filtering changes what gets scheduled, which should trigger cache invalidation. Coordinating these ensures cache remains valid.
 
 ### Problem
 Completed tasks are still processed during scheduling loops. They get evaluated, compared, and included in iterations even though they should never be scheduled.
@@ -157,141 +161,270 @@ for pet in pets:
 
 ---
 
-## 4. Minimum Duration Check
+## 4. Min Heap for Dynamic Minimum Duration Tracking
 
 ### Problem
-When remaining time is very low (e.g., 5 minutes left), the algorithm still iterates through all remaining optional tasks, even if the shortest task requires more time than available.
+When remaining time is very low (e.g., 5 minutes left), the algorithm still iterates through all remaining optional tasks, even if the shortest task requires more time than available. A naive approach of recalculating the minimum after each scheduled task requires O(n) time per check, which is inefficient.
 
 ### Proposed Solution
-Track the minimum task duration among unscheduled tasks and skip iteration when remaining time is less than this minimum.
+Use a **min heap** data structure to maintain dynamic access to the minimum task duration. A min heap provides O(1) access to the minimum element and automatically updates when tasks are scheduled, enabling efficient early exit checks without repeatedly scanning all tasks.
 
 ### Implementation Details
 
-**In `pawpal_system.py` - `Scheduler.generate_owner_schedule()`:**
+**Add import at top of `pawpal_system.py`:**
+```python
+import heapq
+```
+
+**In `Scheduler.generate_owner_schedule()`:**
 ```python
 def generate_owner_schedule(self, owner: Owner, day_type: DayType | str) -> Dict[str, List[Task]]:
-    # ... existing essential task scheduling ...
+    """
+    Generate schedules using min heap for efficient minimum duration tracking.
+    """
+    pets = owner.list_pets()
+    schedule_by_pet: Dict[str, List[Task]] = {pet.pet_name: [] for pet in pets}
     
-    # Gather optional tasks
+    available_minutes = owner.get_available_time(day_type)
+    remaining_minutes = available_minutes
+    
+    # Schedule essential tasks (unchanged)
+    essential_entries: List[tuple[Pet, Task]] = []
+    for pet in pets:
+        for task in pet.list_tasks():
+            if task.is_essential:
+                essential_entries.append((pet, task))
+    
+    for pet, task in essential_entries:
+        duration = task.get_duration()
+        if duration <= remaining_minutes:
+            schedule_by_pet[pet.pet_name].append(task)
+            remaining_minutes -= duration
+    
+    # Build optional tasks list AND min heap simultaneously
     optional_entries: List[tuple[Pet, Task]] = []
-    min_optional_duration = float('inf')
+    duration_heap = []  # Min heap: (duration, pet_name, task_name, task_id)
     
     for pet in pets:
         for task in pet.list_tasks():
             if (not task.is_essential) and task.is_selected_optional:
                 optional_entries.append((pet, task))
-                min_optional_duration = min(min_optional_duration, task.get_duration())
+                # Push to heap for O(1) minimum lookup
+                heapq.heappush(duration_heap, (
+                    task.get_duration(),
+                    pet.pet_name.lower(),
+                    task.task_name.lower(),
+                    id(task)  # Unique identifier for lazy deletion
+                ))
     
-    # Early exit if no task can possibly fit
-    if optional_entries and remaining_minutes < min_optional_duration:
-        return schedule_by_pet
+    # Sort optional tasks by rank (determines scheduling order)
+    optional_entries.sort(
+        key=lambda entry: (
+            entry[1].optional_rank if entry[1].optional_rank is not None else 10**9,
+            entry[0].pet_name.lower(),
+            entry[1].task_name.lower(),
+        )
+    )
     
-    # Sort and schedule optional tasks
-    optional_entries.sort(...)
+    # Track scheduled task IDs for lazy heap maintenance
+    scheduled_ids = set()
     
+    # Schedule optional tasks with heap-based early exit
     for pet, task in optional_entries:
+        # Clean heap top: remove already-scheduled tasks from heap top
+        while duration_heap and duration_heap[0][3] in scheduled_ids:
+            heapq.heappop(duration_heap)
+        
+        # O(1) minimum duration check via heap peek
+        if duration_heap:
+            min_duration = duration_heap[0][0]
+            if remaining_minutes < min_duration:
+                # Early exit! No remaining task can fit
+                break
+        
+        # Try to schedule this task (in rank order)
         duration = task.get_duration()
         if duration <= remaining_minutes:
             schedule_by_pet[pet.pet_name].append(task)
             remaining_minutes -= duration
-        # Optional: update min_optional_duration dynamically for tighter bounds
+            scheduled_ids.add(id(task))  # Mark as scheduled (lazy deletion)
+    
+    return schedule_by_pet
 ```
 
+### How It Works
+
+#### Visual Example:
+```
+Initial state:
+  Heap: [10, 15, 20, 25, 30]  (Feed, Groom, Train, Play, Walk)
+  Remaining: 50 min
+  Min check: 50 >= 10 ✓ Continue scheduling
+
+After scheduling Walk (30 min, rank 1):
+  Heap: [10, 15, 20, 25, 30*]  (*marked in scheduled_ids)
+  Remaining: 20 min
+  Min check: 20 >= 10 ✓ Continue
+
+After scheduling Feed (10 min, rank 2):
+  Heap: [15, 20, 25]  (cleaned automatically when peeking)
+  Remaining: 10 min
+  Min check: 10 < 15 ✗ EARLY EXIT!
+  Result: Skipped checking Play, Groom, Train - saved 3 iterations
+```
+
+#### Lazy Deletion Strategy:
+Instead of removing tasks from the heap immediately (expensive O(n) operation), we:
+1. Mark scheduled tasks in a `scheduled_ids` set
+2. Clean the heap top when checking minimum (only removes what's necessary)
+3. Heap naturally maintains correct minimum as we go
+
 ### Benefits
-- **Saves comparisons**: Avoids unnecessary iteration when no tasks can fit
-- **Smart optimization**: Particularly useful for tight time budgets
-- **Minimal overhead**: Single pass to compute minimum
+- **O(1) minimum lookup**: Just peek at `heap[0]` instead of scanning all tasks
+- **Automatic updates**: Heap structure maintains minimum as tasks are scheduled
+- **Efficient lazy deletion**: Only clean heap when needed, not after every schedule
+- **Scalability**: O(n log n) total complexity vs O(n²) with naive recalculation
+- **Early exit optimization**: Can exit immediately when no task can fit
+
+### Time Complexity Analysis
+
+| Operation | Naive Approach | Min Heap Approach |
+|-----------|---------------|-------------------|
+| Initial setup | O(n) | O(n log n) heapify |
+| Check minimum (each iteration) | O(n) | **O(1)** peek |
+| Total scheduling | O(n²) | **O(n log n)** |
+
+For 100 optional tasks:
+- Naive: ~10,000 operations
+- Min heap: ~664 operations (15x faster!)
 
 ### Considerations
-- Most beneficial when task durations vary significantly
-- Could be extended to track minimum duration dynamically (update after each scheduled task)
-- Trade-off: adds one extra pass for minimum calculation, but saves iterations
+- **Heap overhead**: Adds O(n log n) setup time, but pays off with O(1) lookups
+- **Lazy deletion**: Uses slightly more memory (heap retains scheduled tasks temporarily)
+- **When most beneficial**: Large task lists with varying durations and tight time budgets
+- **Python's heapq**: Built-in, no external dependencies needed
+- **Alternative**: Could use `SortedList` from `sortedcontainers` for cleaner code (requires pip install)
+
+### Alternative: SortedList (Optional Enhancement)
+
+If willing to add a dependency:
+```python
+from sortedcontainers import SortedList
+
+# In generate_owner_schedule():
+durations = SortedList(task.get_duration() for pet, task in optional_entries)
+
+# O(1) minimum check
+if durations and remaining_minutes < durations[0]:
+    break
+
+# O(log n) removal when scheduling
+durations.remove(scheduled_task.get_duration())
+```
+
+This provides cleaner syntax but requires an external library (`pip install sortedcontainers`).
 
 ---
 
-## 6. Batch Rank Updates
+## 6. Hybrid Priority System (3-Tier Groups + Batch Ranking)
 
 ### Problem
-The current UI requires users to update task rankings one at a time. For pet owners with many optional tasks, this becomes tedious and requires multiple page refreshes.
+**Current system limitations:**
+- Pure numerical ranking (1-N) is tedious for many tasks ("Is this rank 7 or 8?")
+- Single task-at-a-time updates require multiple page refreshes
+- No semantic meaning to rank numbers (what does "rank 5" mean?)
+- Cognitive load increases with task count
 
 ### Proposed Solution
-Implement a batch ranking interface that allows users to reorder multiple tasks at once, either through drag-and-drop or a table with editable rank columns.
+Replace pure numerical ranking with a **hybrid 3-tier + ranking system**:
+
+**Structure:**
+- **3 Priority Groups**: High (🔴), Medium (🟡), Low (🟢) for semantic categorization
+- **Ranks within groups**: 1, 2, 3, etc. for precise ordering
+- **Batch editing interface**: Group-based editors with color coding
+
+**Example:**
+```
+🔴 HIGH PRIORITY
+  1. Brush teeth
+  2. Training session
+
+🟡 MEDIUM PRIORITY
+  1. Groom fur
+  2. Play time
+
+🟢 LOW PRIORITY
+  1. Spa treatment
+```
 
 ### Implementation Details
 
-**Option A: Editable Dataframe (Simpler)**
+**Data Model Changes (`pawpal_system.py`):**
 ```python
-# In app.py, replace the ranking section with:
-if optional_tasks:
-    st.markdown("**Optional Task Ranking (Edit ranks directly)**")
-    
-    # Create editable dataframe
-    rank_data = []
-    for task in optional_tasks:
-        rank_data.append({
-            "Task": task["task_name"],
-            "Current Rank": task["optional_rank"] if task["optional_rank"] else "",
-            "New Rank": task["optional_rank"] if task["optional_rank"] else 1
-        })
-    
-    edited_df = st.data_editor(
-        rank_data,
-        column_config={
-            "Task": st.column_config.TextColumn("Task", disabled=True),
-            "Current Rank": st.column_config.NumberColumn("Current Rank", disabled=True),
-            "New Rank": st.column_config.NumberColumn("New Rank", min_value=1, max_value=len(optional_tasks))
-        },
-        hide_index=True,
-        use_container_width=True
-    )
-    
-    if st.button("Apply All Ranks"):
-        for i, task in enumerate(optional_tasks):
-            new_rank = edited_df.iloc[i]["New Rank"]
-            task["optional_rank"] = int(new_rank)
-        st.success(f"Updated ranks for {len(optional_tasks)} tasks")
+class Task:
+    def __init__(
+        self,
+        task_name: str,
+        duration_minutes: int,
+        is_essential: bool = False,
+        priority_group: str = "medium",  # "high", "medium", "low"
+        rank_in_group: Optional[int] = None,  # Rank within priority group
+    ):
+        # ... existing code ...
+        if not is_essential:
+            self.priority_group = priority_group
+            self.rank_in_group = rank_in_group
 ```
 
-**Option B: Simple Reorder Interface**
+**Scheduling Logic:**
 ```python
-# Allow users to reorder tasks by moving them up/down
-st.markdown("**Reorder Optional Tasks (1 = highest priority)**")
-for idx, task in enumerate(optional_tasks):
-    col1, col2, col3, col4 = st.columns([3, 1, 1, 1])
-    with col1:
-        st.write(f"{idx + 1}. {task['task_name']}")
-    with col2:
-        if idx > 0 and st.button("↑", key=f"up_{task['task_name']}"):
-            # Swap with previous task
-            optional_tasks[idx], optional_tasks[idx-1] = optional_tasks[idx-1], optional_tasks[idx]
-            # Update ranks
-            for i, t in enumerate(optional_tasks):
-                t["optional_rank"] = i + 1
-            st.rerun()
-    with col3:
-        if idx < len(optional_tasks) - 1 and st.button("↓", key=f"down_{task['task_name']}"):
-            # Swap with next task
-            optional_tasks[idx], optional_tasks[idx+1] = optional_tasks[idx+1], optional_tasks[idx]
-            # Update ranks
-            for i, t in enumerate(optional_tasks):
-                t["optional_rank"] = i + 1
-            st.rerun()
+def get_selected_ranked_optional_tasks(self, tasks: List[Task]) -> List[Task]:
+    """Sort by: 1) priority group, 2) rank within group, 3) task name."""
+    priority_order = {"high": 1, "medium": 2, "low": 3}
+    
+    def rank_key(task: Task) -> tuple[int, int, str]:
+        priority = priority_order.get(task.priority_group or "medium", 2)
+        rank = task.rank_in_group if task.rank_in_group is not None else 10**9
+        return (priority, rank, task.task_name.lower())
+    
+    filtered = [t for t in tasks if (not t.is_essential) and t.is_selected_optional]
+    return sorted(filtered, key=rank_key)
 ```
+
+**UI Changes (`app.py`):**
+- Task creation: Priority selector (🔴🟡🟢) instead of single numeric rank
+- Ranking interface: Grouped expandable sections (one per priority level)
+- Batch operations: Editable dataframe per priority group, move tasks between groups
+- Visual display: Color-coded badges showing "🔴 High #1" instead of just "Rank 1"
 
 ### Benefits
-- **Faster workflow**: Update multiple rankings in one action
-- **Less clicking**: Reduces repetitive form submissions
-- **Better UX**: More intuitive for managing task priorities
-- **Visual feedback**: Users see rankings relative to each other
+- **Reduced cognitive load**: "High priority #2" vs "Rank 7" is more meaningful
+- **Faster categorization**: Choose priority tier first (3 options vs 15)
+- **Easier reordering**: Manage 2-3 tasks per tier instead of 15 total
+- **Batch operations**: Move all low tasks to medium, auto-sort alphabetically
+- **Visual clarity**: Color coding provides instant feedback
+- **Flexible precision**: Simple users use tiers only, power users fine-tune ranks
 
 ### Considerations
-- Streamlit's drag-and-drop support is limited (requires third-party components)
-- Editable dataframe is simpler and works well for this use case
-- Consider validation to prevent duplicate ranks
+- **Migration strategy**: Auto-convert existing `optional_rank` to tier + rank (top 33% → high, etc.)
+- **Backward compatibility**: Default existing tasks to "medium" priority
+- **UI complexity**: Slightly more complex than single list, but significantly better UX
+- **Phased rollout option**: Start with pure 3-tier (alphabetical within tiers), add ranks in v2
+
+### Alternative Approaches Considered
+- **Pure numerical** (current): Precise but tedious, no semantic meaning
+- **Pure 3-tier**: Simple but lacks precise ordering (needs tie-breaking)
+- **Hybrid** (recommended): Best balance of simplicity and control
 
 ---
 
 ## 7. Incremental Schedule Updates
+
+> **⚠️ Implementation Note**: This proposal is tightly coupled with **#1 (Cache Scheduling Results)**. When implementing together:
+> - Incremental updates should **invalidate the cache** for the current day type
+> - OR update both the displayed schedule AND the cached version simultaneously
+> - Cache key should include completed task state to avoid stale cache hits
+> - Consider: Is incremental update + cache invalidation faster than just regenerating with cache?
 
 ### Problem
 When a user marks a task as completed during the day, the entire schedule must be regenerated from scratch to redistribute the freed time to other tasks.
@@ -302,6 +435,11 @@ Implement incremental updates that:
 2. Recalculate freed time
 3. Attempt to schedule additional optional tasks with the freed time
 4. Only regenerate fully if needed
+
+**Integration with Cache (#1):**
+- Option A: Incremental update invalidates cache, next generation will re-cache
+- Option B: Incremental update modifies both displayed schedule and cache simultaneously
+- Option C: Skip incremental updates if cache exists - just invalidate and regenerate (simpler)
 
 ### Implementation Details
 
@@ -406,6 +544,8 @@ if st.button("Mark completed"):
 ---
 
 ## 8. Smart Default Rankings
+
+> **⚠️ Implementation Note**: Hold off on this proposal until **#6 (Hybrid Priority System)** is implemented. This proposal assumes pure numerical ranking. If using the 3-tier priority system, smart defaults need to assign both `priority_group` and `rank_in_group` instead of just `optional_rank`.
 
 ### Problem
 New optional tasks are created with `optional_rank = None`, requiring manual ranking before they participate in scheduling. This creates friction for users adding multiple tasks.
@@ -682,6 +822,8 @@ Users aren't warned when their essential tasks exceed available time until after
 ### Proposed Solution
 Calculate total essential task duration upfront and display a warning if it exceeds available time for the selected day type.
 
+**When this runs:** On every Streamlit page rerun (automatically updates whenever tasks are added, removed, completed, or time availability changes).
+
 ### Implementation Details
 
 **Add helper function in `app.py`:**
@@ -761,141 +903,6 @@ with st.expander("Essential Time Breakdown by Pet"):
 
 ---
 
-## 12. Task Priority Groups
-
-### Problem
-The current system has only two priority levels: essential (must do) and optional (nice to have). Real-world pet care often has more nuance (e.g., important but not critical tasks).
-
-### Proposed Solution
-Introduce priority groups/tiers within optional tasks:
-- **High priority** (optional but important)
-- **Medium priority** (helpful but flexible)
-- **Low priority** (nice to have if time permits)
-
-Tasks within the same priority group are then sub-ranked numerically.
-
-### Implementation Details
-
-**Update `Task` class in `pawpal_system.py`:**
-```python
-class TaskPriority(Enum):
-    """Priority levels for optional tasks."""
-    HIGH = "high"
-    MEDIUM = "medium"
-    LOW = "low"
-
-class Task:
-    def __init__(
-        self,
-        task_name: str,
-        duration_minutes: int,
-        is_essential: bool = False,
-        is_selected_optional: bool = False,
-        optional_rank: Optional[int] = None,
-        priority_group: str = "medium",  # New parameter
-    ) -> None:
-        # ... existing initialization ...
-        self.priority_group = priority_group if not is_essential else None
-    
-    def set_priority_group(self, priority: str) -> None:
-        """Set priority group for optional tasks."""
-        if self.is_essential:
-            raise ValueError("Essential tasks don't have priority groups")
-        if priority not in ["high", "medium", "low"]:
-            raise ValueError("Priority must be high, medium, or low")
-        self.priority_group = priority
-```
-
-**Update scheduling logic to consider priority groups:**
-```python
-def get_selected_ranked_optional_tasks(self, tasks: List[Task]) -> List[Task]:
-    """
-    Return selected non-essential tasks ordered by priority group, then rank.
-    
-    Sort order:
-    1. Priority group (high -> medium -> low)
-    2. Optional rank within group
-    3. Task name (tie-breaker)
-    """
-    priority_order = {"high": 1, "medium": 2, "low": 3}
-    
-    def rank_key(task: Task) -> tuple[int, int, str]:
-        priority = priority_order.get(task.priority_group or "medium", 2)
-        rank = task.optional_rank if task.optional_rank is not None else 10**9
-        return (priority, rank, task.task_name.lower())
-    
-    filtered = [
-        task
-        for task in tasks
-        if (not task.is_essential) and task.is_selected_optional
-    ]
-    return sorted(filtered, key=rank_key)
-```
-
-**Update UI in `app.py`:**
-```python
-with st.form("add_task_form"):
-    task_name = st.text_input("Task name")
-    col1, col2 = st.columns(2)
-    with col1:
-        duration_minutes = st.number_input(
-            "Duration (minutes)", min_value=1, max_value=480, value=15
-        )
-    with col2:
-        is_essential = st.checkbox("Essential task", value=True)
-    
-    # Add priority group selector for optional tasks
-    if not is_essential:
-        priority_group = st.selectbox(
-            "Priority Level",
-            options=["high", "medium", "low"],
-            index=1,  # Default to medium
-            help="High = important but not essential, Medium = helpful, Low = nice to have"
-        )
-    
-    submit_task = st.form_submit_button("Add task")
-```
-
-**Display priority in task table:**
-```python
-def task_rows_for_pet(pet_data: dict) -> list[dict]:
-    """Return a simple table-friendly view for one pet's tasks."""
-    rows = []
-    for task in pet_data["tasks"]:
-        priority_display = ""
-        if not task["is_essential"]:
-            priority = task.get("priority_group", "medium")
-            priority_icons = {"high": "🔴", "medium": "🟡", "low": "🟢"}
-            priority_display = f"{priority_icons.get(priority, '⚪')} {priority.title()}"
-        
-        rows.append(
-            {
-                "task": task["task_name"],
-                "minutes": task["duration_minutes"],
-                "essential": task["is_essential"],
-                "priority": priority_display if not task["is_essential"] else "N/A",
-                "rank": task.get("optional_rank", ""),
-                "status": "completed" if task.get("is_completed", False) else "pending",
-            }
-        )
-    return rows
-```
-
-### Benefits
-- **More nuanced scheduling**: Better reflects real-world task priorities
-- **Easier bulk management**: Group similar tasks without fine-grained ranking
-- **User-friendly**: Many users find categories easier than numeric rankings
-- **Flexible**: Can still use numeric ranks within each priority group
-
-### Considerations
-- More complex than binary essential/optional system
-- May be overkill for users with few tasks
-- Consider making this an optional "advanced" feature
-- Requires UI changes to support priority selection/editing
-- Backward compatibility: existing tasks default to "medium" priority
-
----
-
 ## Summary of Impacts
 
 ### Quick Wins (Easy Implementation, High Impact)
@@ -906,16 +913,13 @@ def task_rows_for_pet(pet_data: dict) -> list[dict]:
 ### Performance Optimizations (Medium Implementation, High Impact)
 - **#1**: Cache Scheduling Results
 - **#2**: Early Exit on Time Exhaustion
-- **#4**: Minimum Duration Check
+- **#4**: Min Heap for Dynamic Minimum Duration Tracking
 - **#9**: Lazy Task Lookup Dictionary
 
 ### UX Enhancements (Higher Implementation, High User Value)
-- **#6**: Batch Rank Updates
+- **#6**: Hybrid Priority System (3-Tier + Batch Ranking)
 - **#7**: Incremental Schedule Updates
 - **#10**: Schedule Diff Highlighting
-
-### Advanced Features (Complex Implementation, Situational Value)
-- **#12**: Task Priority Groups
 
 ---
 

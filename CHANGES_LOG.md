@@ -1,6 +1,64 @@
 # Changes Log
 
-## Date
+## Date - 2026-03-31
+### Algorithmic Improvements Implementation
+
+Implemented 6 algorithmic optimizations from ALGORITHMIC_IMPROVEMENTS.md proposal:
+
+#### 1. Cache Scheduling Results (#1)
+**Files**: `app.py`
+- Added `compute_state_hash()` to generate MD5 hash of scheduling state
+- Added `schedule_cache` to session state
+- Modified schedule generation to check cache before computing
+- Cache key format: `{state_hash}_{day_type}`
+- Automatic cache size limiting (max 5 schedules)
+- **Benefit**: Instant schedule retrieval when toggling weekday/weekend without data changes
+
+#### 2. Early Exit on Time Exhaustion (#2)
+**Files**: `pawpal_system.py`
+- Added early exit when `remaining_minutes <= 0` after essential tasks
+- Added early exit in optional task loop when time exhausted
+- **Benefit**: Avoids unnecessary iteration when no tasks can fit
+
+#### 3. Min Heap for Dynamic Minimum Duration Tracking (#4)
+**Files**: `pawpal_system.py`
+- Added `import heapq` for heap operations
+- Build min heap of task durations during optional task gathering
+- Lazy deletion strategy using `scheduled_ids` set
+- O(1) minimum duration check via `heap[0]`
+- **Benefit**: Efficient early exit when smallest remaining task won't fit
+
+#### 4. Lazy Task Lookup Dictionary (#9)
+**Files**: `pawpal_system.py`
+- Refactored to build task index in single traversal
+- Separate `essential_entries` and `optional_entries` built simultaneously
+- Eliminated redundant pet/task iterations
+- **Benefit**: O(n) instead of O(2n) for task gathering
+
+#### 5. Schedule Diff Highlighting (#10)
+**Files**: `app.py`
+- Added `previous_schedule` to session state
+- Calculate added/removed tasks when previous schedule exists
+- Display "🆕 Added" or "✓ Same" indicators in schedule table
+- Show expandable section for removed tasks
+- **Benefit**: Users immediately see schedule changes
+
+#### 6. Precompute Total Essential Time (#11)
+**Files**: `app.py`
+- Added `calculate_essential_time()` function
+- Display weekday/weekend essential time totals before generate button
+- Show ⚠️ warnings when essential tasks exceed available time
+- Show ✓ remaining time for optional tasks
+- **Benefit**: Proactive feedback prevents scheduling failures
+
+### Implementation Notes
+- **Held off**: #3 (Pre-filter Completed), #6 (Hybrid Priority System), #7 (Incremental Updates), #8 (Smart Defaults) per dependency analysis
+- All code changes maintain backward compatibility
+- Syntax validated successfully
+
+---
+
+## Date - 2026-03-30
 - 2026-03-30
 
 ## Summary
