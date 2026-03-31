@@ -168,13 +168,30 @@ One tradeoff is that some essential occurrences may still remain unscheduled whe
 
 **a. How you used AI**
 
-- How did you use AI tools during this project (for example: design brainstorming, debugging, refactoring)?
-- What kinds of prompts or questions were most helpful?
+I used AI extensively across all phases of the project:
+
+- **Design Brainstorming**: Asked for ideation on how to move from scalar minute budgets to multi-range availability windows. The AI helped identify which functions would need rewriting and outlined the scope of impact.
+- **Natural-Language Specifications**: Created two detailed revamp design documents (SCHEDULER_REVAMP.md and DAILY/WEEKLY_SCHEDULE_REVAMP.md) without code, describing the new architecture, data model, and behavior before implementation.
+- **Iterative Implementation**: Asked the AI to implement revamps in code, then iteratively refined edge cases (e.g., recurrence catch-up behavior, date-first modeling, occurrence-level actions for disambiguation).
+- **Conceptual Clarification**: Asked questions about ambiguous system behavior (e.g., "What happens when a weekly task is skipped for two weeks?" or "How should multi-pet scheduling work with shared windows?") and got detailed explanations that informed the implementation.
+- **Test Expansion**: Requested comprehensive test suites for recurrence logic, sorting behavior, and edge cases. The AI generated test cases with descriptive one-sentence docstrings that covered critical behaviors.
+- **Documentation Alignment**: Updated changelog, reflection.md UML diagram, and README Features list to match the final implementation without manual alignment errors.
+
+The most helpful prompts were those that clearly stated a design constraint or asked "what should happen when..." because they forced explicit decision-making rather than accepting defaults.
 
 **b. Judgment and verification**
 
-- Describe one moment where you did not accept an AI suggestion as-is.
-- How did you evaluate or verify what the AI suggested?
+One critical moment: when drafting the scheduler revamp, the AI initially suggested supporting both "available windows" and "blocked windows" (unavailable times). I rejected this and clarified we only need available windows, because:
+- The UI would be more confusing (two input modes)
+- Blocked windows can always be modeled as the inverse of available windows
+- Keeping it simple reduced implementation complexity
+
+I verified this decision by testing the window model against real scheduling scenarios (multi-window fragmentation, multi-pet sequencing) and confirming the simpler model still solved the original problem.
+
+Additionally, I validated all implementation changes by:
+- Running the full pytest suite immediately after each major code change (expected: all tests pass)
+- Manually testing the Streamlit UI to confirm state management and recurrence behavior matched the spec docs
+- Checking that new test cases exercise edge cases (catch-up idempotency, same-name task disambiguation, weekend mapping) rather than just happy paths
 
 ---
 
@@ -182,13 +199,35 @@ One tradeoff is that some essential occurrences may still remain unscheduled whe
 
 **a. What you tested**
 
-- What behaviors did you test?
-- Why were these tests important?
+I tested core scheduling behaviors across two test suites (30 total tests, all passing):
+
+- **Priority & ranking**: Essential tasks schedule before optionals; ranked optionals respect rank ordering with deterministic tie-breaking by name.
+- **Window fitting**: Tasks fit into earliest available contiguous window; windows fragment correctly; unscheduled tasks report specific reasons.
+- **Recurrence logic**: Daily tasks regenerate with `+1 day`; weekly tasks with `+7 days`; invalid recurrence configs are caught.
+- **Catch-up materialization**: Missing occurrences are generated deterministically up to target date; re-running catch-up is idempotent.
+- **Date filtering**: Only occurrences due on the selected date are scheduled; occurrence ID prevents same-name task ambiguity.
+- **Multi-pet sequencing**: First pet's tasks consume windows; later pets have reduced availability; scheduling is deterministic given same input.
+- **Weekend/weekday mapping**: Correct day-type is selected for given date; window selection matches day type.
+
+These tests were critical because they cover the core algorithmic guarantees: under time pressure, the scheduler must prioritize essentials consistently, never overcommit windows, and handle recurring occurrences predictably.
 
 **b. Confidence**
 
-- How confident are you that your scheduler works correctly?
-- What edge cases would you test next if you had more time?
+**Confidence: 4/5**
+
+I'm highly confident the scheduler works correctly for the implemented feature set. The algorithm is straightforward (essentials first, then ranked optionals in earliest-fit order), all critical behaviors have explicit tests, and the pytest suite passes cleanly.
+
+Minor gaps:
+- No tests for very large (1000+ task) workloads; performance under scale is untested.
+- No tests for owner/window data serialization/deserialization; if data breaks, the app could fail silently.
+- Daylight savings time transitions and non-US timezones are not tested (though the system uses minutes from midnight, so likely robust).
+
+Next edge cases to test if time allowed:
+- Manually deleting all occurrences of a recurring task and confirming no phantom regenerations.
+- Owner switching between two completely different availability profiles and ensuring schedule recalculates correctly.
+- Adding a task with 0-minute duration (should probably be rejected or handled gracefully).
+- Completing a weekly task, then modifying its recurrence rule; ensuring the regenerated occurrence respects the new rule.
+
 
 ---
 
@@ -198,10 +237,14 @@ One tradeoff is that some essential occurrences may still remain unscheduled whe
 
 - What part of this project are you most satisfied with?
 
+I am satisfied with the backend functionalities that were built to be in line with the original vision as well as the meticulous process I followed to ensure that the app is update in an interative way without breaking previous functionalities. While keeping the original vision in mind, I continuously asked the AI how features can be implemented in a non-destructive manner while constantly assessing what features would need rewriting or which ones would be impacted. After the assessment, the AI drafted key areas that would be impacted and would need rewriting, which steamlined the process for the actual commmand and helped me understand how the overall functionality of the app would be impacted.
+
 **b. What you would improve**
 
 - If you had another iteration, what would you improve or redesign?
+I would improve the design of the UI. Currently, the UI contains bare-bones components that aren't necessarily appealing to look at. Additionally, there are components that would better served when reorganized to create a better flow for the user interactions.
 
 **c. Key takeaway**
 
 - What is one important thing you learned about designing systems or working with AI on this project?
+I learned that it is critical to create outline or planning documents so that the AI can relaibly reference changes being made and what systems would be affected so that I can more confidently press the AI to push those changes. It is also important to continously update the testing suite so that it is consistent with the newly implemented features. This also makes it very important to run the regression tests so that the old features do not break!
