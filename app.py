@@ -1,9 +1,46 @@
 import hashlib
 import json
+from datetime import time
 
 import streamlit as st
 
 from pawpal_system import DayType, Owner, Pet, Scheduler, Task
+
+
+def to_minute_of_day(value: time) -> int:
+    """Convert a time object into minutes-from-midnight."""
+    return int(value.hour) * 60 + int(value.minute)
+
+
+def from_minute_of_day(minute: int) -> time:
+    """Convert minutes-from-midnight into a time object."""
+    return time(hour=(minute // 60), minute=(minute % 60))
+
+
+def format_window(window: tuple[int, int]) -> str:
+    """Format one availability window for display."""
+    start, end = window
+    return f"{start // 60:02d}:{start % 60:02d}-{end // 60:02d}:{end % 60:02d}"
+
+
+def normalize_windows(windows: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Sort and merge overlapping/adjacent windows for UI state."""
+    if not windows:
+        return []
+    sorted_windows = sorted(windows, key=lambda item: (item[0], item[1]))
+    merged = [sorted_windows[0]]
+    for start, end in sorted_windows[1:]:
+        prev_start, prev_end = merged[-1]
+        if start <= prev_end:
+            merged[-1] = (prev_start, max(prev_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def windows_total_minutes(windows: list[tuple[int, int]]) -> int:
+    """Return total minutes in a normalized windows list."""
+    return sum(end - start for start, end in windows)
 
 
 def compute_state_hash() -> str:
@@ -29,8 +66,8 @@ def compute_state_hash() -> str:
 
     state = {
         "owner": st.session_state.owner_name,
-        "weekday_mins": st.session_state.weekday_minutes,
-        "weekend_mins": st.session_state.weekend_minutes,
+        "weekday_windows": st.session_state.weekday_available_windows,
+        "weekend_windows": st.session_state.weekend_available_windows,
         "pets": pets_data,
     }
     return hashlib.md5(json.dumps(state, sort_keys=True).encode()).hexdigest()
@@ -40,14 +77,16 @@ def init_state() -> None:
     """Initialize persistent UI state containers once."""
     if "owner_name" not in st.session_state:
         st.session_state.owner_name = "Jordan"
-    if "weekday_minutes" not in st.session_state:
-        st.session_state.weekday_minutes = 60
-    if "weekend_minutes" not in st.session_state:
-        st.session_state.weekend_minutes = 120
+    if "weekday_available_windows" not in st.session_state:
+        st.session_state.weekday_available_windows = [(540, 600)]
+    if "weekend_available_windows" not in st.session_state:
+        st.session_state.weekend_available_windows = [(600, 720)]
     if "pets" not in st.session_state:
         st.session_state.pets = {}
     if "last_schedule" not in st.session_state:
         st.session_state.last_schedule = None
+    if "last_unscheduled" not in st.session_state:
+        st.session_state.last_unscheduled = None
     if "last_day_type" not in st.session_state:
         st.session_state.last_day_type = DayType.WEEKDAY.value
     # #1: Cache for schedules
@@ -56,6 +95,8 @@ def init_state() -> None:
     # #10: Previous schedule for diff highlighting
     if "previous_schedule" not in st.session_state:
         st.session_state.previous_schedule = None
+    if "window_editor_day" not in st.session_state:
+        st.session_state.window_editor_day = DayType.WEEKDAY.value
 
 
 def calculate_essential_time() -> tuple[int, int]:
@@ -77,12 +118,19 @@ def calculate_essential_time() -> tuple[int, int]:
     return weekday_essential, weekend_essential
 
 
+def calculate_capacity_minutes() -> tuple[int, int]:
+    """Return total available minutes from weekday/weekend windows."""
+    weekday_capacity = windows_total_minutes(st.session_state.weekday_available_windows)
+    weekend_capacity = windows_total_minutes(st.session_state.weekend_available_windows)
+    return weekday_capacity, weekend_capacity
+
+
 def build_owner_from_state() -> Owner:
     """Create runtime Owner/Pet/Task objects from session state."""
     owner = Owner(
         owner_name=st.session_state.owner_name,
-        weekday_available_minutes=int(st.session_state.weekday_minutes),
-        weekend_available_minutes=int(st.session_state.weekend_minutes),
+        weekday_available_windows=list(st.session_state.weekday_available_windows),
+        weekend_available_windows=list(st.session_state.weekend_available_windows),
     )
 
     for pet_name, pet_data in st.session_state.pets.items():
@@ -129,28 +177,84 @@ st.caption(
 )
 
 st.subheader("1) Owner Setup")
-with st.form("owner_form"):
+with st.form("owner_name_form"):
     owner_name = st.text_input("Owner name", value=st.session_state.owner_name)
+    if st.form_submit_button("Save owner profile"):
+        clean_name = (owner_name or "").strip()
+        if not clean_name:
+            st.error("Owner name cannot be empty")
+        else:
+            st.session_state.owner_name = clean_name
+            st.success("Owner profile saved")
+
+st.markdown("Availability windows")
+editor_day = st.radio(
+    "Wizard step 1: Choose day template",
+    options=[DayType.WEEKDAY.value, DayType.WEEKEND.value],
+    index=0 if st.session_state.window_editor_day == DayType.WEEKDAY.value else 1,
+    horizontal=True,
+)
+st.session_state.window_editor_day = editor_day
+
+selected_key = (
+    "weekday_available_windows"
+    if editor_day == DayType.WEEKDAY.value
+    else "weekend_available_windows"
+)
+
+with st.form(f"add_window_form_{editor_day}"):
+    st.caption("Wizard step 2: Add one available time window")
     col1, col2 = st.columns(2)
     with col1:
-        weekday_minutes = st.number_input(
-            "Weekday available minutes",
-            min_value=0,
-            max_value=1440,
-            value=int(st.session_state.weekday_minutes),
+        start_time = st.time_input(
+            "Start",
+            value=time(9, 0),
+            step=900,
+            key=f"start_{editor_day}",
         )
     with col2:
-        weekend_minutes = st.number_input(
-            "Weekend available minutes",
-            min_value=0,
-            max_value=1440,
-            value=int(st.session_state.weekend_minutes),
+        end_time = st.time_input(
+            "End",
+            value=time(10, 0),
+            step=900,
+            key=f"end_{editor_day}",
         )
-    if st.form_submit_button("Save owner profile"):
-        st.session_state.owner_name = owner_name.strip()
-        st.session_state.weekday_minutes = int(weekday_minutes)
-        st.session_state.weekend_minutes = int(weekend_minutes)
-        st.success("Owner profile saved")
+    if st.form_submit_button("Add available window"):
+        start_minute = to_minute_of_day(start_time)
+        end_minute = to_minute_of_day(end_time)
+        if end_minute <= start_minute:
+            st.error("End time must be after start time")
+        else:
+            windows = list(st.session_state[selected_key])
+            windows.append((start_minute, end_minute))
+            st.session_state[selected_key] = normalize_windows(windows)
+            st.success("Window added")
+
+current_windows = st.session_state[selected_key]
+if current_windows:
+    st.caption("Wizard step 3: Review and manage current windows")
+    st.write(", ".join(format_window(window) for window in current_windows))
+    remove_choice = st.selectbox(
+        "Remove a window",
+        options=["(none)"] + [format_window(window) for window in current_windows],
+        key=f"remove_window_{editor_day}",
+    )
+    if st.button("Remove selected window", disabled=(remove_choice == "(none)")):
+        st.session_state[selected_key] = [
+            window
+            for window in current_windows
+            if format_window(window) != remove_choice
+        ]
+        st.success("Window removed")
+else:
+    st.info("No windows defined yet for this day type.")
+
+weekday_capacity, weekend_capacity = calculate_capacity_minutes()
+summary_col1, summary_col2 = st.columns(2)
+with summary_col1:
+    st.metric("Weekday available", f"{weekday_capacity} min")
+with summary_col2:
+    st.metric("Weekend available", f"{weekend_capacity} min")
 
 st.divider()
 st.subheader("2) Pet Management")
@@ -303,31 +407,31 @@ else:
 
     st.divider()
     st.subheader("4) Generate Shared-Time Schedule")
-    
-    # #11: Precompute Total Essential Time (runs on every page render)
+
     weekday_essential, weekend_essential = calculate_essential_time()
-    
+    weekday_capacity, weekend_capacity = calculate_capacity_minutes()
+
     col1, col2 = st.columns(2)
     with col1:
         st.metric("Weekday Essential Tasks", f"{weekday_essential} min")
-        if weekday_essential > st.session_state.weekday_minutes:
+        if weekday_essential > weekday_capacity:
             st.error(
-                f"⚠️ Exceeds available time by {weekday_essential - st.session_state.weekday_minutes} min"
+                f"Exceeds available time by {weekday_essential - weekday_capacity} min"
             )
         else:
-            remaining = st.session_state.weekday_minutes - weekday_essential
-            st.success(f"✓ {remaining} min remaining for optional tasks")
+            remaining = weekday_capacity - weekday_essential
+            st.success(f"{remaining} min available after essentials")
 
     with col2:
         st.metric("Weekend Essential Tasks", f"{weekend_essential} min")
-        if weekend_essential > st.session_state.weekend_minutes:
+        if weekend_essential > weekend_capacity:
             st.error(
-                f"⚠️ Exceeds available time by {weekend_essential - st.session_state.weekend_minutes} min"
+                f"Exceeds available time by {weekend_essential - weekend_capacity} min"
             )
         else:
-            remaining = st.session_state.weekend_minutes - weekend_essential
-            st.success(f"✓ {remaining} min remaining for optional tasks")
-    
+            remaining = weekend_capacity - weekend_essential
+            st.success(f"{remaining} min available after essentials")
+
     day_choice = st.radio(
         "Day type",
         options=[DayType.WEEKDAY.value, DayType.WEEKEND.value],
@@ -337,58 +441,56 @@ else:
 
     if st.button("Generate owner schedule"):
         try:
-            # #1: Cache Scheduling Results
             cache_key = f"{compute_state_hash()}_{day_choice}"
-            
+
             if cache_key in st.session_state.schedule_cache:
-                schedule = st.session_state.schedule_cache[cache_key]
-                # #10: Store previous for diff
+                schedule_result = st.session_state.schedule_cache[cache_key]
                 st.session_state.previous_schedule = st.session_state.last_schedule
-                st.session_state.last_schedule = schedule
+                st.session_state.last_schedule = schedule_result.scheduled_by_pet
+                st.session_state.last_unscheduled = schedule_result.unscheduled_by_pet
                 st.session_state.last_day_type = day_choice
                 st.success("Schedule retrieved from cache")
             else:
                 owner_model = build_owner_from_state()
                 scheduler = Scheduler()
-                schedule = scheduler.generate_owner_schedule(owner_model, day_choice)
-                
-                # Store in cache
-                st.session_state.schedule_cache[cache_key] = schedule
-                
-                # #10: Store previous for diff
+                schedule_result = scheduler.generate_owner_schedule(
+                    owner_model, day_choice
+                )
+
+                st.session_state.schedule_cache[cache_key] = schedule_result
+
                 st.session_state.previous_schedule = st.session_state.last_schedule
-                st.session_state.last_schedule = schedule
+                st.session_state.last_schedule = schedule_result.scheduled_by_pet
+                st.session_state.last_unscheduled = schedule_result.unscheduled_by_pet
                 st.session_state.last_day_type = day_choice
-                
-                # Limit cache size to 5 most recent schedules
+
                 if len(st.session_state.schedule_cache) > 5:
                     oldest_key = next(iter(st.session_state.schedule_cache))
                     st.session_state.schedule_cache.pop(oldest_key)
-                
+
                 st.success("Schedule generated")
         except ValueError as exc:
             st.error(f"Could not generate schedule: {exc}")
 
     if st.session_state.last_schedule is not None:
         st.markdown("Generated schedule")
-        day_minutes = (
-            st.session_state.weekday_minutes
+        day_capacity = (
+            weekday_capacity
             if st.session_state.last_day_type == DayType.WEEKDAY.value
-            else st.session_state.weekend_minutes
+            else weekend_capacity
         )
 
-        # #10: Calculate diff if previous schedule exists
         added_tasks = {}
         removed_tasks = {}
-        
+
         if st.session_state.previous_schedule is not None:
             prev = st.session_state.previous_schedule
             curr = st.session_state.last_schedule
-            
+
             for pet_name in curr.keys():
-                prev_task_names = {t.task_name for t in prev.get(pet_name, [])}
-                curr_task_names = {t.task_name for t in curr.get(pet_name, [])}
-                
+                prev_task_names = {t.task.task_name for t in prev.get(pet_name, [])}
+                curr_task_names = {t.task.task_name for t in curr.get(pet_name, [])}
+
                 added_tasks[pet_name] = curr_task_names - prev_task_names
                 removed_tasks[pet_name] = prev_task_names - curr_task_names
 
@@ -400,33 +502,53 @@ else:
                     continue
                 pet_rows = []
                 for task in tasks:
-                    used_minutes += task.get_duration()
+                    used_minutes += task.task.get_duration()
                     row = {
-                        "task": task.task_name,
-                        "minutes": task.get_duration(),
-                        "essential": task.is_essential,
-                        "optional_rank": task.optional_rank,
-                        "status": task.get_status(),
+                        "task": task.task.task_name,
+                        "start": task.start_time,
+                        "end": task.end_time,
+                        "minutes": task.task.get_duration(),
+                        "essential": task.task.is_essential,
+                        "optional_rank": task.task.optional_rank,
+                        "status": task.task.get_status(),
                     }
-                    
-                    # #10: Add change indicator
-                    if task.task_name in added_tasks.get(pet_name, set()):
-                        row["change"] = "🆕 Added"
+
+                    if task.task.task_name in added_tasks.get(pet_name, set()):
+                        row["change"] = "Added"
                     else:
-                        row["change"] = "✓ Same"
-                    
+                        row["change"] = "Same"
+
                     pet_rows.append(row)
                 st.dataframe(pet_rows, use_container_width=True, hide_index=True)
-        
-        # #10: Show removed tasks summary
+
+                unscheduled_items = (
+                    st.session_state.last_unscheduled.get(pet_name, [])
+                    if st.session_state.last_unscheduled
+                    else []
+                )
+                if unscheduled_items:
+                    unscheduled_rows = [
+                        {
+                            "task": item.task.task_name,
+                            "minutes": item.task.get_duration(),
+                            "essential": item.task.is_essential,
+                            "reason": item.reason,
+                        }
+                        for item in unscheduled_items
+                    ]
+                    st.markdown("Unscheduled tasks")
+                    st.dataframe(
+                        unscheduled_rows, use_container_width=True, hide_index=True
+                    )
+
         total_removed = sum(len(tasks) for tasks in removed_tasks.values())
         if total_removed > 0:
-            with st.expander(f"⚠️ {total_removed} task(s) removed from previous schedule"):
+            with st.expander(f"{total_removed} task(s) removed from previous schedule"):
                 for pet_name, task_names in removed_tasks.items():
                     if task_names:
                         st.write(f"**{pet_name}**: {', '.join(task_names)}")
 
-        remaining_minutes = max(0, int(day_minutes) - int(used_minutes))
+        remaining_minutes = max(0, int(day_capacity) - int(used_minutes))
         st.info(
-            f"Total available: {day_minutes} min | Used: {used_minutes} min | Remaining: {remaining_minutes} min"
+            f"Total available: {day_capacity} min | Used: {used_minutes} min | Remaining: {remaining_minutes} min"
         )

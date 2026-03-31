@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import heapq
+from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 
 class DayType(Enum):
@@ -27,6 +28,80 @@ def _normalize_day_type(day_type: DayType | str) -> DayType:
     raise ValueError(
         "day_type must be DayType.WEEKDAY, DayType.WEEKEND, 'weekday', or 'weekend'"
     )
+
+
+def _validate_window(start_minute: int, end_minute: int) -> tuple[int, int]:
+    """Validate one availability window as minutes-from-midnight."""
+    start = int(start_minute)
+    end = int(end_minute)
+    if start < 0 or end < 0:
+        raise ValueError("window times cannot be negative")
+    if start >= 24 * 60 or end > 24 * 60:
+        raise ValueError("window times must be within a single day")
+    if end <= start:
+        raise ValueError("window end must be greater than start")
+    return (start, end)
+
+
+def _normalize_windows(windows: List[tuple[int, int]]) -> List[tuple[int, int]]:
+    """Sort and merge overlapping or adjacent availability windows."""
+    validated = [_validate_window(start, end) for start, end in windows]
+    if not validated:
+        return []
+
+    validated.sort(key=lambda pair: (pair[0], pair[1]))
+    merged: List[tuple[int, int]] = [validated[0]]
+
+    for start, end in validated[1:]:
+        prev_start, prev_end = merged[-1]
+        if start <= prev_end:
+            merged[-1] = (prev_start, max(prev_end, end))
+        else:
+            merged.append((start, end))
+
+    return merged
+
+
+def format_minute_of_day(minute: int) -> str:
+    """Convert minutes-from-midnight into HH:MM 24-hour time."""
+    if minute < 0 or minute > 24 * 60:
+        raise ValueError("minute must be between 0 and 1440")
+    hours = minute // 60
+    mins = minute % 60
+    return f"{hours:02d}:{mins:02d}"
+
+
+@dataclass(frozen=True)
+class ScheduledTask:
+    """A scheduled task instance with explicit start and end times."""
+
+    task: Task
+    start_minute: int
+    end_minute: int
+
+    @property
+    def start_time(self) -> str:
+        return format_minute_of_day(self.start_minute)
+
+    @property
+    def end_time(self) -> str:
+        return format_minute_of_day(self.end_minute)
+
+
+@dataclass(frozen=True)
+class UnscheduledTask:
+    """A task that could not be scheduled and why."""
+
+    task: Task
+    reason: str
+
+
+@dataclass(frozen=True)
+class OwnerScheduleResult:
+    """All scheduling output for a generated owner schedule."""
+
+    scheduled_by_pet: Dict[str, List[ScheduledTask]]
+    unscheduled_by_pet: Dict[str, List[UnscheduledTask]]
 
 
 class Task:
@@ -155,22 +230,28 @@ class Pet:
 
 
 class Owner:
-    """Stores owner profile data, pets, and available care time by day type."""
+    """Stores owner profile data, pets, and available care windows by day type."""
 
     def __init__(
         self,
         owner_name: str,
-        weekday_available_minutes: int = 0,
-        weekend_available_minutes: int = 0,
+        weekday_available_windows: Optional[List[Tuple[int, int]]] = None,
+        weekend_available_windows: Optional[List[Tuple[int, int]]] = None,
     ) -> None:
         self.owner_name = ""
-        self.weekday_available_minutes = 0
-        self.weekend_available_minutes = 0
+        self.weekday_available_windows: List[tuple[int, int]] = []
+        self.weekend_available_windows: List[tuple[int, int]] = []
         self.pets: List[Pet] = []
 
         self.set_owner_name(owner_name)
-        self.set_weekday_time(weekday_available_minutes)
-        self.set_weekend_time(weekend_available_minutes)
+        self.set_available_windows(
+            DayType.WEEKDAY,
+            weekday_available_windows if weekday_available_windows else [],
+        )
+        self.set_available_windows(
+            DayType.WEEKEND,
+            weekend_available_windows if weekend_available_windows else [],
+        )
 
     def set_owner_name(self, name: str) -> None:
         """Update owner name."""
@@ -178,26 +259,58 @@ class Owner:
             raise ValueError("owner_name cannot be empty")
         self.owner_name = name.strip()
 
-    def set_weekday_time(self, minutes: int) -> None:
-        """Set available weekday minutes."""
-        if minutes < 0:
-            raise ValueError("weekday_available_minutes cannot be negative")
-        self.weekday_available_minutes = int(minutes)
+    def set_available_windows(
+        self, day_type: DayType | str, windows: List[Tuple[int, int]]
+    ) -> None:
+        """Replace all available windows for a day type."""
+        normalized = _normalize_day_type(day_type)
+        merged = _normalize_windows(list(windows))
+        if normalized is DayType.WEEKDAY:
+            self.weekday_available_windows = merged
+            return
+        if normalized is DayType.WEEKEND:
+            self.weekend_available_windows = merged
+            return
+        raise ValueError("Unsupported day_type")
 
-    def set_weekend_time(self, minutes: int) -> None:
-        """Set available weekend minutes."""
-        if minutes < 0:
-            raise ValueError("weekend_available_minutes cannot be negative")
-        self.weekend_available_minutes = int(minutes)
+    def add_available_window(
+        self, day_type: DayType | str, start_minute: int, end_minute: int
+    ) -> None:
+        """Add one available window and re-normalize."""
+        normalized = _normalize_day_type(day_type)
+        start, end = _validate_window(start_minute, end_minute)
+        existing = self.get_available_windows(normalized)
+        self.set_available_windows(normalized, existing + [(start, end)])
 
-    def get_available_time(self, day_type: DayType | str) -> int:
-        """Return available minutes for weekday or weekend."""
+    def remove_available_window(
+        self, day_type: DayType | str, start_minute: int, end_minute: int
+    ) -> None:
+        """Remove one exact available window."""
+        normalized = _normalize_day_type(day_type)
+        target = _validate_window(start_minute, end_minute)
+        existing = self.get_available_windows(normalized)
+        if target not in existing:
+            raise ValueError("Window not found")
+        updated = [window for window in existing if window != target]
+        self.set_available_windows(normalized, updated)
+
+    def get_available_windows(self, day_type: DayType | str) -> List[tuple[int, int]]:
+        """Return normalized available windows for day type."""
         normalized = _normalize_day_type(day_type)
         if normalized is DayType.WEEKDAY:
-            return self.weekday_available_minutes
+            return list(self.weekday_available_windows)
         if normalized is DayType.WEEKEND:
-            return self.weekend_available_minutes
+            return list(self.weekend_available_windows)
         raise ValueError("Unsupported day_type")
+
+    def get_schedulable_windows(self, day_type: DayType | str) -> List[tuple[int, int]]:
+        """Return windows used by scheduler for a day type."""
+        return self.get_available_windows(day_type)
+
+    def get_available_time(self, day_type: DayType | str) -> int:
+        """Return total available minutes across all normalized windows."""
+        windows = self.get_available_windows(day_type)
+        return sum(end - start for start, end in windows)
 
     def add_pet(self, pet: Pet) -> None:
         """Associate a pet with this owner."""
@@ -223,30 +336,67 @@ class Owner:
 
 
 class Scheduler:
-    """Builds schedules using owner availability and pet task metadata."""
+    """Builds schedules using owner availability windows and pet task metadata."""
+
+    def _find_earliest_fit(
+        self, free_windows: List[tuple[int, int]], duration: int
+    ) -> Optional[int]:
+        """Return index of earliest window that can fit duration contiguously."""
+        for index, (start, end) in enumerate(free_windows):
+            if end - start >= duration:
+                return index
+        return None
+
+    def _reserve_window_slice(
+        self, free_windows: List[tuple[int, int]], window_index: int, duration: int
+    ) -> tuple[int, int]:
+        """Reserve from start of selected free window and update free windows."""
+        start, end = free_windows[window_index]
+        reserved_start = start
+        reserved_end = start + duration
+
+        if reserved_end == end:
+            free_windows.pop(window_index)
+        else:
+            free_windows[window_index] = (reserved_end, end)
+
+        return (reserved_start, reserved_end)
 
     def schedule_essential_tasks(
-        self, tasks: List[Task], available_minutes: int
-    ) -> List[Task]:
+        self, tasks: List[Task], free_windows: List[tuple[int, int]]
+    ) -> tuple[List[ScheduledTask], List[UnscheduledTask]]:
         """
-        Schedule essential tasks first in input order.
+        Schedule essential tasks first in input order with explicit timestamps.
 
-        Overflow policy: if all essential tasks cannot fit, include the ones that fit
-        in order and leave the rest unscheduled.
+        Overflow policy: include essential tasks that fit contiguously and mark
+        remaining ones unscheduled.
         """
-        if available_minutes < 0:
-            raise ValueError("available_minutes cannot be negative")
-
-        scheduled: List[Task] = []
-        used_minutes = 0
+        scheduled: List[ScheduledTask] = []
+        unscheduled: List[UnscheduledTask] = []
         for task in tasks:
             if not task.is_essential:
                 continue
             duration = task.get_duration()
-            if used_minutes + duration <= available_minutes:
-                scheduled.append(task)
-                used_minutes += duration
-        return scheduled
+            window_index = self._find_earliest_fit(free_windows, duration)
+            if window_index is None:
+                unscheduled.append(
+                    UnscheduledTask(
+                        task=task,
+                        reason="No available time window can fit this essential task",
+                    )
+                )
+                continue
+            start_minute, end_minute = self._reserve_window_slice(
+                free_windows, window_index, duration
+            )
+            scheduled.append(
+                ScheduledTask(
+                    task=task,
+                    start_minute=start_minute,
+                    end_minute=end_minute,
+                )
+            )
+        return (scheduled, unscheduled)
 
     def get_selected_ranked_optional_tasks(self, tasks: List[Task]) -> List[Task]:
         """
@@ -268,96 +418,139 @@ class Scheduler:
         return sorted(filtered, key=rank_key)
 
     def schedule_ranked_optional_tasks(
-        self, ranked_optional_tasks: List[Task], remaining_minutes: int
-    ) -> List[Task]:
-        """Schedule ranked optional tasks that fit in remaining minutes."""
-        if remaining_minutes < 0:
-            raise ValueError("remaining_minutes cannot be negative")
-
-        scheduled: List[Task] = []
-        used_minutes = 0
+        self, ranked_optional_tasks: List[Task], free_windows: List[tuple[int, int]]
+    ) -> tuple[List[ScheduledTask], List[UnscheduledTask]]:
+        """Schedule ranked optional tasks that fit in remaining free windows."""
+        scheduled: List[ScheduledTask] = []
+        unscheduled: List[UnscheduledTask] = []
         for task in ranked_optional_tasks:
             duration = task.get_duration()
-            if used_minutes + duration <= remaining_minutes:
-                scheduled.append(task)
-                used_minutes += duration
-        return scheduled
+            window_index = self._find_earliest_fit(free_windows, duration)
+            if window_index is None:
+                unscheduled.append(
+                    UnscheduledTask(
+                        task=task,
+                        reason="No remaining contiguous availability for optional task",
+                    )
+                )
+                continue
+            start_minute, end_minute = self._reserve_window_slice(
+                free_windows, window_index, duration
+            )
+            scheduled.append(
+                ScheduledTask(
+                    task=task,
+                    start_minute=start_minute,
+                    end_minute=end_minute,
+                )
+            )
+        return (scheduled, unscheduled)
 
     def generate_schedule(
         self, owner: Owner, pet: Pet, day_type: DayType | str
-    ) -> List[Task]:
+    ) -> tuple[List[ScheduledTask], List[UnscheduledTask]]:
         """Generate a full schedule for one pet and day type."""
         if owner.pets and pet not in owner.pets:
             raise ValueError("Selected pet is not associated with the owner")
 
-        available_minutes = owner.get_available_time(day_type)
+        free_windows = owner.get_schedulable_windows(day_type)
         tasks = pet.list_tasks()
 
-        essential_scheduled = self.schedule_essential_tasks(tasks, available_minutes)
-        remaining_minutes = self.calculate_remaining_minutes(
-            available_minutes, essential_scheduled
+        essential_scheduled, essential_unscheduled = self.schedule_essential_tasks(
+            tasks, free_windows
         )
 
-        # Sort optional tasks once and reuse to avoid repeated sorting work.
         ranked_optional_tasks = self.get_selected_ranked_optional_tasks(tasks)
-        optional_scheduled = self.schedule_ranked_optional_tasks(
-            ranked_optional_tasks, remaining_minutes
+        optional_scheduled, optional_unscheduled = self.schedule_ranked_optional_tasks(
+            ranked_optional_tasks, free_windows
         )
 
-        return essential_scheduled + optional_scheduled
+        return (
+            essential_scheduled + optional_scheduled,
+            essential_unscheduled + optional_unscheduled,
+        )
 
     def generate_owner_schedule(
         self, owner: Owner, day_type: DayType | str
-    ) -> Dict[str, List[Task]]:
+    ) -> OwnerScheduleResult:
         """
-        Generate schedules for all pets with one shared owner time budget.
+        Generate schedules for all pets with one shared owner window budget.
 
         Policy:
         1) Schedule essential tasks across all pets first.
-        2) Use remaining time for selected non-essential tasks ranked globally.
-        
+        2) Use remaining windows for selected non-essential tasks ranked globally.
+
         Optimizations:
         - #9: Lazy task lookup (build task index once)
         - #2: Early exit when time exhausted
         - #4: Min heap for efficient minimum duration tracking
         """
         pets = owner.list_pets()
-        schedule_by_pet: Dict[str, List[Task]] = {pet.pet_name: [] for pet in pets}
+        schedule_by_pet: Dict[str, List[ScheduledTask]] = {
+            pet.pet_name: [] for pet in pets
+        }
+        unscheduled_by_pet: Dict[str, List[UnscheduledTask]] = {
+            pet.pet_name: [] for pet in pets
+        }
 
-        available_minutes = owner.get_available_time(day_type)
-        remaining_minutes = available_minutes
+        free_windows = owner.get_schedulable_windows(day_type)
 
-        # #9: Build task index in single traversal (Lazy Task Lookup)
         essential_entries: List[tuple[Pet, Task]] = []
         optional_entries: List[tuple[Pet, Task]] = []
-        duration_heap = []  # #4: Min heap for O(1) minimum duration lookup
-        
+        duration_heap = []
+
         for pet in pets:
             for task in pet.list_tasks():
                 if task.is_essential:
                     essential_entries.append((pet, task))
                 elif task.is_selected_optional:
                     optional_entries.append((pet, task))
-                    # Push to heap for minimum duration tracking
-                    heapq.heappush(duration_heap, (
-                        task.get_duration(),
-                        pet.pet_name.lower(),
-                        task.task_name.lower(),
-                        id(task)
-                    ))
+                    heapq.heappush(
+                        duration_heap,
+                        (
+                            task.get_duration(),
+                            pet.pet_name.lower(),
+                            task.task_name.lower(),
+                            id(task),
+                        ),
+                    )
 
-        # Schedule essential tasks
+        # Schedule essential tasks in insertion order.
         for pet, task in essential_entries:
             duration = task.get_duration()
-            if duration <= remaining_minutes:
-                schedule_by_pet[pet.pet_name].append(task)
-                remaining_minutes -= duration
+            window_index = self._find_earliest_fit(free_windows, duration)
+            if window_index is None:
+                unscheduled_by_pet[pet.pet_name].append(
+                    UnscheduledTask(
+                        task=task,
+                        reason="No available time window can fit this essential task",
+                    )
+                )
+                continue
+            start_minute, end_minute = self._reserve_window_slice(
+                free_windows, window_index, duration
+            )
+            schedule_by_pet[pet.pet_name].append(
+                ScheduledTask(
+                    task=task,
+                    start_minute=start_minute,
+                    end_minute=end_minute,
+                )
+            )
 
-        # #2: Early exit if no time for optional tasks
-        if remaining_minutes <= 0:
-            return schedule_by_pet
+        if not free_windows:
+            for pet, task in optional_entries:
+                unscheduled_by_pet[pet.pet_name].append(
+                    UnscheduledTask(
+                        task=task,
+                        reason="No remaining contiguous availability for optional task",
+                    )
+                )
+            return OwnerScheduleResult(
+                scheduled_by_pet=schedule_by_pet,
+                unscheduled_by_pet=unscheduled_by_pet,
+            )
 
-        # Sort optional tasks by rank (for scheduling order)
         optional_entries.sort(
             key=lambda entry: (
                 entry[1].optional_rank if entry[1].optional_rank is not None else 10**9,
@@ -366,47 +559,64 @@ class Scheduler:
             )
         )
 
-        # Track scheduled task IDs for heap maintenance
         scheduled_ids = set()
 
-        # Schedule optional tasks with heap-based early exit
         for pet, task in optional_entries:
-            # #4: Clean heap top - remove already-scheduled tasks
             while duration_heap and duration_heap[0][3] in scheduled_ids:
                 heapq.heappop(duration_heap)
-            
-            # #4: O(1) minimum duration check via heap peek
+
             if duration_heap:
                 min_duration = duration_heap[0][0]
-                if remaining_minutes < min_duration:
-                    # Early exit! No remaining task can fit
+                if all((end - start) < min_duration for start, end in free_windows):
                     break
-            
-            # #2: Early exit if time exhausted
-            if remaining_minutes <= 0:
+
+            if not free_windows:
                 break
-            
-            # Try to schedule this task (in rank order)
+
             duration = task.get_duration()
-            if duration <= remaining_minutes:
-                schedule_by_pet[pet.pet_name].append(task)
-                remaining_minutes -= duration
-                scheduled_ids.add(id(task))
+            window_index = self._find_earliest_fit(free_windows, duration)
+            if window_index is None:
+                unscheduled_by_pet[pet.pet_name].append(
+                    UnscheduledTask(
+                        task=task,
+                        reason="No remaining contiguous availability for optional task",
+                    )
+                )
+                continue
+            start_minute, end_minute = self._reserve_window_slice(
+                free_windows, window_index, duration
+            )
+            schedule_by_pet[pet.pet_name].append(
+                ScheduledTask(
+                    task=task,
+                    start_minute=start_minute,
+                    end_minute=end_minute,
+                )
+            )
+            scheduled_ids.add(id(task))
 
-        return schedule_by_pet
+        remaining_optional_ids = {
+            id(task) for _, task in optional_entries if id(task) not in scheduled_ids
+        }
+        for pet, task in optional_entries:
+            if id(task) in remaining_optional_ids and not any(
+                uns.task is task for uns in unscheduled_by_pet[pet.pet_name]
+            ):
+                unscheduled_by_pet[pet.pet_name].append(
+                    UnscheduledTask(
+                        task=task,
+                        reason="No remaining contiguous availability for optional task",
+                    )
+                )
 
-    def calculate_remaining_minutes(
-        self, available_minutes: int, scheduled_tasks: List[Task]
-    ) -> int:
-        """Compute remaining minutes after scheduling tasks."""
-        if available_minutes < 0:
-            raise ValueError("available_minutes cannot be negative")
-        used_minutes = sum(task.get_duration() for task in scheduled_tasks)
-        return max(0, available_minutes - used_minutes)
+        return OwnerScheduleResult(
+            scheduled_by_pet=schedule_by_pet,
+            unscheduled_by_pet=unscheduled_by_pet,
+        )
 
     def get_unscheduled_tasks(
-        self, all_tasks: List[Task], scheduled_tasks: List[Task]
+        self, all_tasks: List[Task], scheduled_tasks: List[ScheduledTask]
     ) -> List[Task]:
         """Return tasks that were not included in the final schedule."""
-        scheduled_ids = {id(task) for task in scheduled_tasks}
+        scheduled_ids = {id(item.task) for item in scheduled_tasks}
         return [task for task in all_tasks if id(task) not in scheduled_ids]

@@ -33,26 +33,29 @@ def test_pet_add_task_increases_count_and_lookup_works():
     assert pet.get_task_by_name("take a walk") is task
 
 
-def test_owner_day_type_accepts_enum_and_string():
-    """Owner time lookup should support both enum and string day types."""
-    owner = Owner("Alice", weekday_available_minutes=60, weekend_available_minutes=120)
+def test_owner_windows_merge_and_time_lookup_supports_enum_and_string():
+    """Owner windows should normalize and total minutes should be retrievable by enum/string."""
+    owner = Owner(
+        "Alice",
+        weekday_available_windows=[(480, 510), (500, 540), (600, 630)],
+        weekend_available_windows=[(600, 660)],
+    )
 
-    assert owner.get_available_time(DayType.WEEKDAY) == 60
-    assert owner.get_available_time("weekend") == 120
+    assert owner.get_available_windows(DayType.WEEKDAY) == [(480, 540), (600, 630)]
+    assert owner.get_available_time(DayType.WEEKDAY) == 90
+    assert owner.get_available_time("weekend") == 60
 
 
-def test_generate_owner_schedule_uses_shared_budget_essential_first():
-    """Owner schedule should share one budget across pets and prioritize essential tasks."""
-    owner = Owner("Alice", weekday_available_minutes=50, weekend_available_minutes=100)
+def test_generate_owner_schedule_uses_shared_windows_essential_first_with_timestamps():
+    """Owner schedule should share windows across pets, prioritize essential, and expose timestamps."""
+    owner = Owner("Alice", weekday_available_windows=[(540, 600)])
 
     pet1 = Pet("Fluffy")
     pet2 = Pet("Spot")
 
-    # Essential tasks consume 45 minutes total.
     feed_fluffy = Task("Feed Fluffy", 15, is_essential=True)
     walk_spot = Task("Walk Spot", 30, is_essential=True)
 
-    # Optional tasks: only one 5-minute slot should remain.
     groom_fluffy = Task("Groom Fluffy", 20)
     groom_fluffy.mark_non_essential(rank=1)
     brush_spot = Task("Brush Spot", 5)
@@ -67,28 +70,55 @@ def test_generate_owner_schedule_uses_shared_budget_essential_first():
     owner.add_pet(pet2)
 
     scheduler = Scheduler()
-    schedule = scheduler.generate_owner_schedule(owner, DayType.WEEKDAY)
+    result = scheduler.generate_owner_schedule(owner, DayType.WEEKDAY)
+    schedule = result.scheduled_by_pet
 
-    assert [t.task_name for t in schedule["Fluffy"]] == ["Feed Fluffy"]
-    assert [t.task_name for t in schedule["Spot"]] == ["Walk Spot", "Brush Spot"]
+    assert [t.task.task_name for t in schedule["Fluffy"]] == ["Feed Fluffy"]
+    assert [t.task.task_name for t in schedule["Spot"]] == ["Walk Spot", "Brush Spot"]
+
+    assert schedule["Fluffy"][0].start_time == "09:00"
+    assert schedule["Fluffy"][0].end_time == "09:15"
+    assert schedule["Spot"][0].start_time == "09:15"
+    assert schedule["Spot"][0].end_time == "09:45"
+    assert schedule["Spot"][1].start_time == "09:45"
+    assert schedule["Spot"][1].end_time == "09:50"
+
+    assert [u.task.task_name for u in result.unscheduled_by_pet["Fluffy"]] == [
+        "Groom Fluffy"
+    ]
 
 
 def test_non_selected_optional_task_is_not_scheduled():
     """Non-essential tasks must be selected optional to be considered."""
-    owner = Owner("Ana", weekday_available_minutes=30)
+    owner = Owner("Ana", weekday_available_windows=[(480, 510)])
     pet = Pet("Mochi")
     med = Task("Medication", 10, is_essential=True)
     puzzle = Task("Puzzle Toy", 10, is_essential=False, optional_rank=1)
-    # puzzle is non-essential but not selected optional yet.
 
     pet.add_task(med)
     pet.add_task(puzzle)
     owner.add_pet(pet)
 
     scheduler = Scheduler()
-    tasks = scheduler.generate_schedule(owner, pet, "weekday")
+    scheduled, unscheduled = scheduler.generate_schedule(owner, pet, "weekday")
 
-    assert [t.task_name for t in tasks] == ["Medication"]
+    assert [item.task.task_name for item in scheduled] == ["Medication"]
+    assert [item.task.task_name for item in unscheduled] == []
+
+
+def test_task_must_fit_contiguous_window_not_total_sum():
+    """A task should remain unscheduled if only fragmented time exists."""
+    owner = Owner("Mina", weekday_available_windows=[(480, 490), (500, 510)])
+    pet = Pet("Nori")
+    long_walk = Task("Long Walk", 15, is_essential=True)
+    pet.add_task(long_walk)
+    owner.add_pet(pet)
+
+    scheduler = Scheduler()
+    result = scheduler.generate_owner_schedule(owner, DayType.WEEKDAY)
+
+    assert result.scheduled_by_pet["Nori"] == []
+    assert result.unscheduled_by_pet["Nori"][0].task.task_name == "Long Walk"
 
 
 def test_duplicate_pet_names_are_rejected_case_insensitive():
