@@ -1,6 +1,39 @@
 # Changes Log
 
 ## Date - 2026-03-31
+### Major Revamp 1: Scheduler Timing System Revamp
+
+**Files**: `pawpal_system.py`, `app.py`, `tests/test_pawpal.py`, `SCHEDULER_REVAMP.md`
+
+- Replaced scalar weekday/weekend minute budgeting with normalized availability windows.
+- Added explicit timestamp placement (`start`/`end`) for scheduled tasks.
+- Updated owner-level scheduling to consume one shared window pool across all pets.
+- Added date-aware schedule generation entrypoints and retained legacy APIs for compatibility.
+- Updated UI to configure windows and render timestamped schedules.
+- Expanded tests to verify weekday/weekend timing behavior, contiguous-fit constraints, and deterministic scheduling.
+
+**Outcome**:
+- Scheduler now produces precise task time ranges and supports richer time modeling.
+
+### Major Revamp 2: Daily/Weekly Recurrence + Date-Based Scheduling Revamp
+
+**Files**: `pawpal_system.py`, `app.py`, `tests/test_pawpal.py`, `DAILY/WEEKLY_SCHEDULE_REVAMP.md`
+
+- Added recurrence model (`none`, `daily`, `weekly`) with required weekly day metadata.
+- Introduced occurrence-level `due_date` as the canonical scheduling key.
+- Implemented completion-triggered next-occurrence generation:
+  - daily: `+1 day`
+  - weekly: `+7 days`
+- Added deterministic catch-up generation so skipped dates still materialize missing occurrences up to selected date.
+- Made task actions occurrence-specific by ID to prevent same-name ambiguity across dates.
+- Expanded recurrence edge-case test suite (idempotency, catch-up, due-date filtering, weekend mapping).
+
+**Outcome**:
+- App now supports robust recurring task lifecycle management while preserving predictable, date-scoped schedule generation.
+
+---
+
+## Date - 2026-03-31
 ### Algorithmic Improvements Implementation
 
 Implemented 6 algorithmic optimizations from ALGORITHMIC_IMPROVEMENTS.md proposal:

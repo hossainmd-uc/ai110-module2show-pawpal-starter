@@ -568,20 +568,37 @@ else:
                         break
                 st.success(f"Marked '{completion_target}' as completed")
         with action_col2:
-            reopen_target = st.selectbox("Reopen task", options=task_names)
+            reopen_options = {
+                f"{t['task_name']} [{t.get('due_date')}] ({str(t.get('task_id'))[:8]})": t.get(
+                    "task_id"
+                )
+                for t in selected_pet_data["tasks"]
+            }
+            reopen_target = st.selectbox(
+                "Reopen task", options=list(reopen_options.keys())
+            )
             if st.button("Mark pending"):
                 for task in selected_pet_data["tasks"]:
-                    if task["task_name"] == reopen_target:
+                    if task.get("task_id") == reopen_options.get(reopen_target):
                         task["is_completed"] = False
+                        task["completed_at_date"] = None
                         break
                 st.success(f"Marked '{reopen_target}' as pending")
         with action_col3:
-            delete_target = st.selectbox("Remove task", options=task_names)
+            delete_options = {
+                f"{t['task_name']} [{t.get('due_date')}] ({str(t.get('task_id'))[:8]})": t.get(
+                    "task_id"
+                )
+                for t in selected_pet_data["tasks"]
+            }
+            delete_target = st.selectbox(
+                "Remove task", options=list(delete_options.keys())
+            )
             if st.button("Delete task"):
                 selected_pet_data["tasks"] = [
                     t
                     for t in selected_pet_data["tasks"]
-                    if t["task_name"] != delete_target
+                    if t.get("task_id") != delete_options.get(delete_target)
                 ]
                 st.success(f"Deleted task '{delete_target}'")
     else:

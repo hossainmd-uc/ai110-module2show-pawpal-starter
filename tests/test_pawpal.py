@@ -370,3 +370,36 @@ def test_repeated_generation_with_catchup_does_not_duplicate_occurrences():
         if t.source_template_id == task.source_template_id
     ]
     assert len(due_dates) == len(set(due_dates))
+
+
+def test_same_name_occurrences_can_be_reopened_independently_by_occurrence_id():
+    """When names collide across dates, reopening should target one occurrence only."""
+    pet = Pet("Echo")
+    first = Task("Walk", 15, due_date="2026-04-01")
+    second = Task("Walk", 15, due_date="2026-04-02")
+    pet.add_task(first)
+    pet.add_task(second)
+
+    first.mark_completed("2026-04-01")
+    second.mark_completed("2026-04-02")
+
+    target = pet.get_task_by_occurrence_id(first.occurrence_id)
+    target.mark_incomplete()
+
+    assert pet.get_task_by_occurrence_id(first.occurrence_id).is_completed is False
+    assert pet.get_task_by_occurrence_id(second.occurrence_id).is_completed is True
+
+
+def test_same_name_occurrences_can_be_deleted_independently_by_occurrence_id():
+    """Removing one same-name occurrence should not remove another date's occurrence."""
+    pet = Pet("Echo")
+    first = Task("Feed", 10, due_date="2026-04-01")
+    second = Task("Feed", 10, due_date="2026-04-02")
+    pet.add_task(first)
+    pet.add_task(second)
+
+    pet.remove_task(pet.get_task_by_occurrence_id(first.occurrence_id))
+
+    remaining_ids = {task.occurrence_id for task in pet.list_tasks()}
+    assert first.occurrence_id not in remaining_ids
+    assert second.occurrence_id in remaining_ids
