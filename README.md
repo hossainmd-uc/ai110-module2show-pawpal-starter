@@ -106,7 +106,7 @@ pip install -r requirements.txt
 python -m pytest -v
 ```
 
-### Suggested workflow
+### Followed workflow
 
 1. Read the scenario carefully and identify requirements and edge cases.
 2. Draft a UML diagram (classes, attributes, methods, relationships).
